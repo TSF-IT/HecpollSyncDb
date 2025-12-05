@@ -1,0 +1,445 @@
+﻿<!doctype html>
+<html lang="fr">
+<head>
+    <meta charset="utf-8" />
+    <title>HecPoll – Visionneuse de logs</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+        :root {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color-scheme: dark light;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background: #0f172a;
+            color: #e5e7eb;
+        }
+
+        .app {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 1.5rem;
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .card {
+            background: #020617;
+            border-radius: 0.75rem;
+            padding: 1rem 1.25rem;
+            box-shadow: 0 10px 25px rgba(15,23,42,0.8);
+        }
+
+        .controls {
+            display: grid;
+            grid-template-columns: 1.2fr 1fr 1fr;
+            gap: 0.75rem;
+            margin-bottom: 0.75rem;
+            align-items: center;
+        }
+
+            .controls label {
+                font-size: 0.8rem;
+                color: #9ca3af;
+                display: block;
+                margin-bottom: 0.25rem;
+            }
+
+        input[type="file"],
+        input[type="text"],
+        select {
+            width: 100%;
+            padding: 0.4rem 0.5rem;
+            border-radius: 0.5rem;
+            border: 1px solid #1f2937;
+            background: #020617;
+            color: #e5e7eb;
+            font-size: 0.85rem;
+        }
+
+            input[type="text"]::placeholder {
+                color: #6b7280;
+            }
+
+        .badges {
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-top: 0.3rem;
+        }
+
+        .badge {
+            padding: 0.2rem 0.55rem;
+            border-radius: 999px;
+            border: 1px solid #1f2937;
+            font-size: 0.7rem;
+            cursor: pointer;
+            user-select: none;
+        }
+
+            .badge.active {
+                background: #1d4ed8;
+                border-color: #1d4ed8;
+            }
+
+            .badge.INFO {
+                border-color: #22c55e;
+                color: #bbf7d0;
+            }
+
+            .badge.WARN {
+                border-color: #eab308;
+                color: #fef9c3;
+            }
+
+            .badge.ERROR {
+                border-color: #ef4444;
+                color: #fecaca;
+            }
+
+        .table-container {
+            margin-top: 0.75rem;
+            border-radius: 0.75rem;
+            border: 1px solid #111827;
+            overflow: hidden;
+            background: #020617;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.78rem;
+        }
+
+        thead {
+            background: #020617;
+        }
+
+        th, td {
+            padding: 0.4rem 0.5rem;
+            text-align: left;
+            border-bottom: 1px solid #111827;
+            vertical-align: top;
+        }
+
+        th {
+            cursor: pointer;
+            user-select: none;
+            position: sticky;
+            top: 0;
+            background: #020617;
+            z-index: 1;
+        }
+
+        tbody tr:nth-child(even) {
+            background: #020617;
+        }
+
+        tbody tr:nth-child(odd) {
+            background: #020617;
+        }
+
+        tbody tr:hover {
+            background: #111827;
+        }
+
+        .level-INFO {
+            color: #4ade80;
+        }
+
+        .level-WARN {
+            color: #eab308;
+        }
+
+        .level-ERROR {
+            color: #fca5a5;
+        }
+
+        .message-cell {
+            max-width: 360px;
+        }
+
+        .nowrap {
+            white-space: nowrap;
+        }
+
+        .pill {
+            padding: 0.15rem 0.45rem;
+            border-radius: 999px;
+            border: 1px solid #1f2937;
+            font-size: 0.68rem;
+            display: inline-block;
+        }
+
+        .meta {
+            font-size: 0.7rem;
+            color: #9ca3af;
+            margin-bottom: 0.5rem;
+        }
+
+        .data-json {
+            max-width: 360px;
+            max-height: 4.2rem;
+            overflow: auto;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-size: 0.7rem;
+            background: #020617;
+            border-radius: 0.5rem;
+            padding: 0.2rem 0.3rem;
+            border: 1px solid #111827;
+        }
+
+        .status-bar {
+            margin-top: 0.5rem;
+            font-size: 0.72rem;
+            color: #9ca3af;
+            display: flex;
+            justify-content: space-between;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+            .status-bar strong {
+                color: #e5e7eb;
+            }
+
+        @media (max-width: 900px) {
+            .controls {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <h1>HecPoll – Visionneuse de logs</h1>
+        <p class="meta">
+            Fichiers attendus : <strong>hecpoll-sync_*.log</strong> (JSON par ligne) générés par la moulinette.
+            Glisse un fichier ou utilise le sélecteur ci-dessous.
+        </p>
+
+        <div class="card">
+            <div class="controls">
+                <div>
+                    <label for="fileInput">Fichier de logs</label>
+                    <input id="fileInput" type="file" accept=".log,.txt,application/jsonl,text/plain" />
+                </div>
+                <div>
+                    <label>Filtrer par niveau</label>
+                    <div class="badges" id="levelFilters">
+                        <span class="badge INFO active" data-level="INFO">INFO</span>
+                        <span class="badge WARN active" data-level="WARN">WARN</span>
+                        <span class="badge ERROR active" data-level="ERROR">ERROR</span>
+                    </div>
+                </div>
+                <div>
+                    <label for="phaseFilter">Filtrer par phase</label>
+                    <select id="phaseFilter">
+                        <option value="">Toutes les phases</option>
+                    </select>
+                    <label for="searchInput" style="margin-top:0.3rem;">Recherche texte</label>
+                    <input id="searchInput" type="text" placeholder="Filtrer par message / données..." />
+                </div>
+            </div>
+
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th data-sort="timestamp">Date/heure ▲▼</th>
+                            <th data-sort="niveau">Niveau</th>
+                            <th data-sort="phase">Phase</th>
+                            <th data-sort="message">Message</th>
+                            <th data-sort="donnees">Données</th>
+                        </tr>
+                    </thead>
+                    <tbody id="logBody">
+                        <!-- lignes injectées ici -->
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="status-bar">
+                <span id="statusCount">0 lignes</span>
+                <span id="statusFile"></span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    const fileInput = document.getElementById('fileInput');
+    const logBody = document.getElementById('logBody');
+    const phaseFilter = document.getElementById('phaseFilter');
+    const searchInput = document.getElementById('searchInput');
+    const levelFilters = document.getElementById('levelFilters');
+    const statusCount = document.getElementById('statusCount');
+    const statusFile = document.getElementById('statusFile');
+
+    let allLogs = [];
+    let currentSort = { key: 'timestamp', asc: true };
+
+    fileInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        statusFile.textContent = `Fichier : ${file.name}`;
+        const text = await file.text();
+        allLogs = parseLogFile(text);
+        populatePhaseFilter(allLogs);
+        renderTable();
+    });
+
+    function parseLogFile(text) {
+        const lines = text.split(/\r?\n/);
+        const logs = [];
+
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+
+            try {
+                const obj = JSON.parse(trimmed);
+                // Normalisation
+                obj.timestamp = obj.timestamp || obj.date || obj.time || null;
+                logs.push(obj);
+            } catch (e) {
+                // Ligne non JSON, on ignore
+                console.warn('Ligne de log ignorée (non JSON) :', line);
+            }
+        }
+
+        return logs;
+    }
+
+    function populatePhaseFilter(logs) {
+        const phases = Array.from(new Set(logs.map(l => l.phase).filter(Boolean))).sort();
+        phaseFilter.innerHTML = '<option value="">Toutes les phases</option>';
+        for (const p of phases) {
+            const opt = document.createElement('option');
+            opt.value = p;
+            opt.textContent = p;
+            phaseFilter.appendChild(opt);
+        }
+    }
+
+    levelFilters.addEventListener('click', (e) => {
+        const badge = e.target.closest('.badge');
+        if (!badge) return;
+        badge.classList.toggle('active');
+        renderTable();
+    });
+
+    phaseFilter.addEventListener('change', renderTable);
+    searchInput.addEventListener('input', renderTable);
+
+    document.querySelectorAll('th[data-sort]').forEach(th => {
+        th.addEventListener('click', () => {
+            const key = th.getAttribute('data-sort');
+            if (currentSort.key === key) {
+                currentSort.asc = !currentSort.asc;
+            } else {
+                currentSort.key = key;
+                currentSort.asc = true;
+            }
+            renderTable();
+        });
+    });
+
+    function renderTable() {
+        const activeLevels = Array.from(levelFilters.querySelectorAll('.badge.active'))
+            .map(b => b.dataset.level);
+
+        const phase = phaseFilter.value;
+        const search = searchInput.value.trim().toLowerCase();
+
+        let filtered = allLogs.filter(l => {
+            if (l.niveau && !activeLevels.includes(l.niveau)) return false;
+            if (phase && l.phase !== phase) return false;
+
+            if (search) {
+                const msg = (l.message || '').toLowerCase();
+                const dataStr = JSON.stringify(l.donnees || {}).toLowerCase();
+                if (!msg.includes(search) && !dataStr.includes(search)) return false;
+            }
+
+            return true;
+        });
+
+        filtered.sort((a, b) => {
+            const key = currentSort.key;
+            let va = a[key];
+            let vb = b[key];
+
+            if (key === 'timestamp') {
+                va = new Date(va || 0).getTime();
+                vb = new Date(vb || 0).getTime();
+            } else {
+                va = (va ?? '').toString();
+                vb = (vb ?? '').toString();
+            }
+
+            if (va < vb) return currentSort.asc ? -1 : 1;
+            if (va > vb) return currentSort.asc ? 1 : -1;
+            return 0;
+        });
+
+        logBody.innerHTML = '';
+
+        for (const l of filtered) {
+            const tr = document.createElement('tr');
+
+            const tdDate = document.createElement('td');
+            tdDate.className = 'nowrap';
+            const d = l.timestamp ? new Date(l.timestamp) : null;
+            tdDate.textContent = d ? d.toLocaleString('fr-FR') : '';
+            tr.appendChild(tdDate);
+
+            const tdLevel = document.createElement('td');
+            tdLevel.className = 'nowrap level-' + (l.niveau || '').toUpperCase();
+            tdLevel.textContent = l.niveau || '';
+            tr.appendChild(tdLevel);
+
+            const tdPhase = document.createElement('td');
+            tdPhase.className = 'nowrap';
+            tdPhase.innerHTML = l.phase
+                ? `<span class="pill">${escapeHtml(l.phase)}</span>`
+                : '';
+            tr.appendChild(tdPhase);
+
+            const tdMsg = document.createElement('td');
+            tdMsg.className = 'message-cell';
+            tdMsg.textContent = l.message || '';
+            tr.appendChild(tdMsg);
+
+            const tdData = document.createElement('td');
+            if (l.donnees) {
+                const pre = document.createElement('pre');
+                pre.className = 'data-json';
+                pre.textContent = JSON.stringify(l.donnees, null, 2);
+                tdData.appendChild(pre);
+            } else {
+                tdData.textContent = '';
+            }
+            tr.appendChild(tdData);
+
+            logBody.appendChild(tr);
+        }
+
+        statusCount.textContent = `${filtered.length} ligne(s) affichée(s) / ${allLogs.length} au total`;
+    }
+
+    function escapeHtml(str) {
+        return (str || '').toString()
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;");
+    }
+    </script>
+</body>
+</html>

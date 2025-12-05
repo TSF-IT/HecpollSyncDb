@@ -1,206 +1,114 @@
-using System;
-using System.Data;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Collections.Concurrent;
 using Microsoft.Data.SqlClient;
 
-internal static class DbSafeReader
+/// <summary>
+/// Service d'enrichissement des cartes / véhicules / conducteurs.
+/// L'idée est d'éviter de recalculer à chaque ligne et de centraliser la logique
+/// sur la manière de retrouver les infos manquantes à partir des tables legacy.
+/// </summary>
+public static class CardEnrichmentService
 {
-    public static int? GetIntNullable(SqlDataReader reader, int ordinal)
+    // Cache en mémoire pour éviter de requêter la base en boucle
+    private static readonly ConcurrentDictionary<string, CardVehicleInfo> _cardVehicleCache = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Récupère (ou calcule) les infos véhicule associées à un PAN de carte.
+    /// </summary>
+    public static async Task<CardVehicleInfo?> GetCardVehicleMappingAsync(SqlConnection connection, SqlTransaction? transaction, string cardPan, CancellationToken cancellationToken = default)
     {
-        if (reader.IsDBNull(ordinal)) return null;
-        var value = reader.GetValue(ordinal);
-        try
-        {
-            return Convert.ToInt32(value, System.Globalization.CultureInfo.InvariantCulture);
-        }
-        catch
-        {
-            Console.WriteLine($"[DB-SAFE] Impossible de convertir en int la valeur '{value}' (index {ordinal}, type {value?.GetType().Name}).");
+        if (string.IsNullOrWhiteSpace(cardPan))
             return null;
-        }
-    }
 
-    public static decimal? GetDecimalNullable(SqlDataReader reader, int ordinal)
-    {
-        if (reader.IsDBNull(ordinal)) return null;
-        var value = reader.GetValue(ordinal);
-        try
-        {
-            return Convert.ToDecimal(value, System.Globalization.CultureInfo.InvariantCulture);
-        }
-        catch
-        {
-            Console.WriteLine($"[DB-SAFE] Impossible de convertir en decimal la valeur '{value}' (index {ordinal}, type {value?.GetType().Name}).");
-            return null;
-        }
-    }
-
-    public static string? GetStringNullable(SqlDataReader reader, int ordinal)
-    {
-        return reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
-    }
-}
-
-internal sealed class CardEnrichment
-{
-    public int? CardsId { get; init; }
-    public string? CardCustomerNumber { get; init; }
-    public string? CardNumber { get; init; }
-    public string? CardPanResolved { get; init; }
-    public int? CardTankNumber { get; init; }
-
-    public int? CustomersId { get; init; }
-    public string? CustomerNumber { get; init; }
-    public string? CustomerName { get; init; }
-
-    public int? MandatorsId { get; init; }
-    public string? MandatorNumber { get; init; }
-    public string? MandatorDescription { get; init; }
-
-    public int? VehiclesId { get; init; }
-    public string? VehicleLicensePlate { get; init; }
-}
-
-internal static class CardEnrichmentService
-{
-    public static async Task<CardEnrichment?> EnrichAsync(
-        SqlConnection conn,
-        string? cardToken,
-        CancellationToken cancellationToken)
-    {
-        if (string.IsNullOrWhiteSpace(cardToken))
-            return null;
+        if (_cardVehicleCache.TryGetValue(cardPan, out var cached))
+            return cached;
 
         const string sql = @"
 SELECT TOP (1)
-       c.ID_CARDS,
-       c.Customer,              -- CardCustomerNumber
-       c.Number,                -- CardNumber
-       c.PAN,                   -- Card PAN/token
-       c.TankNumber,            -- Card tank
-       cu.ID_CUSTOMERS,
-       cu.Number       AS CustomerNumber,
-       COALESCE(cu.Company, '') + ' ' + COALESCE(cu.Lastname, '') AS CustomerName,
-       m.ID_MANDATORS,
-       m.Number       AS MandatorNumber,
-       m.Description  AS MandatorDescription,
-       v.ID_VEHICLES,
-       v.LicensePlate
+       c.CardsID,
+       c.CardCustomerNumber,
+       c.CardNumber,
+       c.CardExtNumber,
+       c.CardSystem,
+       c.CardTankNumber,
+       c.CardLimit,
+       c.CardOnHand,
+       c.CardValidFrom,
+       c.CardValidTo,
+       v.VehiclesID,
+       v.VehicleLicensePlate,
+       e.EmployeesID,
+       e.EmployeeNumber,
+       e.EmployeeName
 FROM dbo.CARDS c
-LEFT JOIN dbo.CUSTOMERS cu ON cu.ID_CUSTOMERS = c.CustomersID
-LEFT JOIN dbo.MANDATORS m   ON m.ID_MANDATORS   = cu.MandatorsID
-LEFT JOIN dbo.VEHICLES v    ON v.ID_VEHICLES    = c.VehiclesID
-WHERE c.PAN = @pan OR c.Number = @cardNumber
-ORDER BY c.ID_CARDS;";
+LEFT JOIN dbo.VEHICLES v ON v.CardsID = c.CardsID
+LEFT JOIN dbo.EMPLOYEES e ON e.CardsID = c.CardsID
+WHERE c.CardPAN = @CardPAN
+ORDER BY c.CardValidFrom DESC";
 
-        await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@pan", (object)cardToken ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@cardNumber", (object)cardToken ?? DBNull.Value);
+        await using var cmd = new SqlCommand(sql, connection, transaction)
+        {
+            CommandType = System.Data.CommandType.Text
+        };
+        cmd.Parameters.AddWithValue("@CardPAN", cardPan);
 
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken))
             return null;
 
-        var cardsId            = DbSafeReader.GetIntNullable(reader, 0);
-        var cardCustomerNumber = DbSafeReader.GetStringNullable(reader, 1);
-        var cardNumber         = DbSafeReader.GetStringNullable(reader, 2);
-        var cardPanToken       = DbSafeReader.GetStringNullable(reader, 3);
-        var cardTankNumber     = DbSafeReader.GetIntNullable(reader, 4);
-
-        var customersId        = DbSafeReader.GetIntNullable(reader, 5);
-        var customerNumber     = DbSafeReader.GetStringNullable(reader, 6);
-        var customerName       = DbSafeReader.GetStringNullable(reader, 7);
-
-        var mandatorsId        = DbSafeReader.GetIntNullable(reader, 8);
-        var mandatorNumber     = DbSafeReader.GetStringNullable(reader, 9);
-        var mandatorDesc       = DbSafeReader.GetStringNullable(reader, 10);
-
-        var vehiclesId         = DbSafeReader.GetIntNullable(reader, 11);
-        var licensePlate       = DbSafeReader.GetStringNullable(reader, 12);
-
-        // Résolution du CardPAN : priorité à la plaque si connue, sinon token
-        string? cardPanResolved = null;
-        if (!string.IsNullOrWhiteSpace(licensePlate))
+        var info = new CardVehicleInfo
         {
-            var compact = licensePlate.Replace(" ", string.Empty).ToUpperInvariant();
-            cardPanResolved = compact.EndsWith("=") ? compact : compact + "=";
-        }
-        else if (!string.IsNullOrWhiteSpace(cardPanToken))
-        {
-            var compact = cardPanToken.Trim();
-            cardPanResolved = compact.EndsWith("=") ? compact : compact + "=";
-        }
-
-        Console.WriteLine(
-            $"[CARD-ENRICH] PAN={cardPanToken}, Token={cardToken}, ResolvedPAN={cardPanResolved}, Plate={licensePlate}, CardId={cardsId}, Cust={customerNumber}, Mand={mandatorNumber}");
-
-        return new CardEnrichment
-        {
-            CardsId             = cardsId,
-            CardCustomerNumber  = cardCustomerNumber,
-            CardNumber          = cardNumber,
-            CardPanResolved     = cardPanResolved,
-            CardTankNumber      = cardTankNumber,
-            CustomersId         = customersId,
-            CustomerNumber      = customerNumber,
-            CustomerName        = customerName,
-            MandatorsId         = mandatorsId,
-            MandatorNumber      = mandatorNumber,
-            MandatorDescription = mandatorDesc,
-            VehiclesId          = vehiclesId,
-            VehicleLicensePlate = licensePlate
+            CardsId = reader["CardsID"] as int?,
+            CardCustomerNumber = reader["CardCustomerNumber"] as string,
+            CardNumber = reader["CardNumber"] as string,
+            CardExtNumber = reader["CardExtNumber"] as string,
+            CardSystem = reader["CardSystem"] as string,
+            CardTankNumber = reader["CardTankNumber"] as string,
+            CardLimit = reader["CardLimit"] as decimal? ?? 0m,
+            CardOnHand = reader["CardOnHand"] as decimal? ?? 0m,
+            CardValidFrom = reader["CardValidFrom"] as DateTime?,
+            CardValidTo = reader["CardValidTo"] as DateTime?,
+            VehiclesId = reader["VehiclesID"] as int?,
+            VehicleLicensePlate = reader["VehicleLicensePlate"] as string,
+            EmployeesId = reader["EmployeesID"] as int?,
+            EmployeeNumber = reader["EmployeeNumber"] as string,
+            EmployeeName = reader["EmployeeName"] as string
         };
+
+        _cardVehicleCache[cardPan] = info;
+        return info;
     }
 
-    // Enrichissement via la table de map CardDriverVehicleMap (scénario backfill)
-    public static async Task<CardEnrichment?> EnrichFromCardMapAsync(
-        SqlConnection conn,
-        int transactionsId,
-        int transNumber,
-        CancellationToken cancellationToken)
+    /// <summary>
+    /// Utilisé en fin de traitement pour voir un peu l'état du cache et comprendre
+    /// combien de cartes / véhicules différents ont été rencontrés.
+    /// </summary>
+    public static void DumpCacheState()
     {
-        const string sql = @"
-SELECT TOP (1)
-       VehicleCardId,
-       VehicleCardCustomer,
-       VehicleCardNumber,
-       VehicleCardPan,
-       VehicleId,
-       VehiclePlate,
-       VehicleCustomersId,
-       VehicleCustomerNumber,
-       VehicleCustomerName,
-       MandatorsId,
-       MandatorNumber,
-       MandatorDescription
-FROM dbo.CardDriverVehicleMap
-WHERE TransactionsID = @txId
-  AND TransNumber = @transNumber;";
-
-        await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@txId", transactionsId);
-        cmd.Parameters.AddWithValue("@transNumber", transNumber);
-
-        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
-        if (!await reader.ReadAsync(cancellationToken))
-            return null;
-
-        return new CardEnrichment
-        {
-            CardsId             = DbSafeReader.GetIntNullable(reader, 0),
-            CardCustomerNumber  = DbSafeReader.GetStringNullable(reader, 1),
-            CardNumber          = DbSafeReader.GetStringNullable(reader, 2),
-            CardPanResolved     = DbSafeReader.GetStringNullable(reader, 3),
-            VehiclesId          = DbSafeReader.GetIntNullable(reader, 4),
-            VehicleLicensePlate = DbSafeReader.GetStringNullable(reader, 5),
-            CustomersId         = DbSafeReader.GetIntNullable(reader, 6),
-            CustomerNumber      = DbSafeReader.GetStringNullable(reader, 7),
-            CustomerName        = DbSafeReader.GetStringNullable(reader, 8),
-            MandatorsId         = DbSafeReader.GetIntNullable(reader, 9),
-            MandatorNumber      = DbSafeReader.GetStringNullable(reader, 10),
-            MandatorDescription = DbSafeReader.GetStringNullable(reader, 11),
-            CardTankNumber      = null
-        };
+        Console.WriteLine("=== CardEnrichmentService – État du cache ===");
+        Console.WriteLine($"Entrées cache carte/véhicule : {_cardVehicleCache.Count}");
     }
+}
+
+/// <summary>
+/// Modèle des infos enrichies sur la carte / véhicule / conducteur.
+/// </summary>
+public sealed class CardVehicleInfo
+{
+    public int? CardsId { get; set; }
+    public string? CardCustomerNumber { get; set; }
+    public string? CardNumber { get; set; }
+    public string? CardExtNumber { get; set; }
+    public string? CardSystem { get; set; }
+    public string? CardTankNumber { get; set; }
+    public decimal CardLimit { get; set; }
+    public decimal CardOnHand { get; set; }
+    public DateTime? CardValidFrom { get; set; }
+    public DateTime? CardValidTo { get; set; }
+
+    public int? VehiclesId { get; set; }
+    public string? VehicleLicensePlate { get; set; }
+
+    public int? EmployeesId { get; set; }
+    public string? EmployeeNumber { get; set; }
+    public string? EmployeeName { get; set; }
 }

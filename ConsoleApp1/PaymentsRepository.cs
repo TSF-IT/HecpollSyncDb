@@ -1,663 +1,460 @@
-using CsvHelper;
+using System.Data;
+using Hecpoll.Sync;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
-using System;
-using System.Globalization;
-using System.Threading;
 
-internal sealed class PaymentSnapshot
+/// <summary>
+/// Logique d'accès / écriture des paiements et transactions shadow.
+/// Toute la mécanique "je trouve la transaction, je la crée dans TRANSACTIONS_SHADOW,
+/// j'enrichis la payment, etc." est centralisée ici.
+/// </summary>
+public static class PaymentsRepository
 {
-    public int IdPayments { get; init; }
-    public int TransactionsId { get; init; }
-    public DateTime TransDateTime { get; init; }
-    public int TransNumber { get; init; }
-    public int TerminalsId { get; init; }
-    public decimal? TransQuantity { get; init; }
-    public decimal? TransAmount { get; init; }
-    public decimal? TransAmountNet { get; init; }
-    public decimal? TransAmountTax { get; init; }
-    public decimal? TransTaxRate { get; init; }
-    public string? TransArticleCode { get; init; }
-    public string? TransArticleDescription { get; init; }
-    public string? CurrencySymbol { get; init; }
-    public string? CardPAN { get; init; }
-    public string? VehicleLicensePlate { get; init; }
-}
-
-internal enum PaymentDryRunAction
-{
-    Insert,
-    Update,
-    NoOp
-}
-
-internal static class PaymentsRepository
-{
-    private static string _paymentsTableName = "dbo.PAYMENTS";
-
-    public static async Task<int?> ResolveArticleIdFromMapAsync(
-    SqlConnection conn,
-    string? articleCode,
-    string? articleDescription,
-    decimal taxRate,
-    CancellationToken ct)
-    {
-        if (string.IsNullOrWhiteSpace(articleCode) || string.IsNullOrWhiteSpace(articleDescription))
-            return null;
-
-        const string sql = @"
-SELECT TOP (1) ArticleId
-FROM dbo.ArticleMapFromPayments
-WHERE Code        = @code
-  AND Description = @desc
-  AND TaxRate     = @rate;";
-
-        await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@code", articleCode);
-        cmd.Parameters.AddWithValue("@desc", articleDescription);
-        cmd.Parameters.AddWithValue("@rate", taxRate);
-
-        var result = await cmd.ExecuteScalarAsync(ct);
-        if (result == null || result == DBNull.Value)
-            return null;
-
-        return Convert.ToInt32(result, CultureInfo.InvariantCulture);
-    }
-
-
-    public static async Task<CardDriverVehicleMapRow?> GetCardVehicleMappingAsync(
-    SqlConnection conn,
-    string driverPanWithoutEquals,
-    int transNumber,
-    CancellationToken ct)
-    {
-        // On stocke DriverPan sans '=' dans la table, donc on normalise
-        const string sql = @"
-SELECT TOP (1)
-       DriverPan,
-       TransactionsID,
-       TransNumber,
-       TransDateTime,
-       VehicleCardId,
-       VehicleCardCustomer,
-       VehicleCardNumber,
-       VehicleCardPan,
-       VehicleId,
-       VehiclePlate,
-       VehicleCustomersId,
-       VehicleCustomerNumber,
-       VehicleCustomerName,
-       MandatorsId,
-       MandatorNumber,
-       MandatorDescription,
-       VehicleContractId
-FROM dbo.CardDriverVehicleMap
-WHERE DriverPan   = @driverPan
-  AND TransNumber = @transNumber;";
-
-        await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@driverPan", driverPanWithoutEquals);
-        cmd.Parameters.AddWithValue("@transNumber", transNumber);
-
-        await using var reader = await cmd.ExecuteReaderAsync(ct);
-        if (!await reader.ReadAsync(ct))
-            return null;
-
-        var driverPan = DbSafeReader.GetStringNullable(reader, 0);
-        var transactionsId = DbSafeReader.GetIntNullable(reader, 1);
-        var transNumberFromDb = DbSafeReader.GetIntNullable(reader, 2);
-        var transDateTime = reader.GetDateTime(3);
-        var vehicleCardId = DbSafeReader.GetIntNullable(reader, 4);
-        var vehicleCardCustomer = DbSafeReader.GetStringNullable(reader, 5);
-        var vehicleCardNumber = DbSafeReader.GetStringNullable(reader, 6);
-        var vehicleCardPan = DbSafeReader.GetStringNullable(reader, 7);
-        var vehicleId = DbSafeReader.GetIntNullable(reader, 8);
-        var vehiclePlate = DbSafeReader.GetStringNullable(reader, 9);
-        var vehicleCustomersId = DbSafeReader.GetIntNullable(reader, 10);
-        var vehicleCustomerNumber = DbSafeReader.GetStringNullable(reader, 11);
-        var vehicleCustomerName = DbSafeReader.GetStringNullable(reader, 12);
-        var mandatorsId = DbSafeReader.GetIntNullable(reader, 13);
-        var mandatorNumber = DbSafeReader.GetStringNullable(reader, 14);
-        var mandatorDescription = DbSafeReader.GetStringNullable(reader, 15);
-        var vehicleContractId = DbSafeReader.GetIntNullable(reader, 16);
-
-        if (driverPan is null || transactionsId is null || transNumberFromDb is null || vehicleCardId is null
-            || vehicleCardCustomer is null || vehicleCardNumber is null || vehicleCardPan is null)
-        {
-            Console.WriteLine("[DB-SAFE] CardDriverVehicleMap row incomplete.");
-            return null;
-        }
-
-        return new CardDriverVehicleMapRow
-        {
-            DriverPan = driverPan,
-            TransactionsId = transactionsId.Value,
-            TransNumber = transNumberFromDb.Value,
-            TransDateTime = transDateTime,
-            VehicleCardId = vehicleCardId.Value,
-            VehicleCardCustomer = vehicleCardCustomer,
-            VehicleCardNumber = vehicleCardNumber,
-            VehicleCardPan = vehicleCardPan,
-            VehicleId = vehicleId,
-            VehiclePlate = vehiclePlate,
-            VehicleCustomersId = vehicleCustomersId,
-            VehicleCustomerNumber = vehicleCustomerNumber,
-            VehicleCustomerName = vehicleCustomerName,
-            MandatorsId = mandatorsId,
-            MandatorNumber = mandatorNumber,
-            MandatorDescription = mandatorDescription,
-            VehicleContractId = vehicleContractId,
-        };
-    }
-
+    private static IConfiguration? _configuration;
 
     public static void Configure(IConfiguration configuration)
     {
-        var name = configuration.GetSection("Import")["PaymentsTableName"];
-        _paymentsTableName = string.IsNullOrWhiteSpace(name) ? "dbo.PAYMENTS" : name.Trim();
-        Console.WriteLine($"[PAYMENTS-CONFIG] Using table '{_paymentsTableName}' as target for PAYMENTS.");
+        _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
     }
 
-    public static async Task<int?> GetTransactionIdAsync(
-        SqlConnection conn,
-        int transNumber,
-        int terminalsId,
-        DateTime transDateTime)
+    // -------------------------------------------------------------------------
+    // API publique appelée depuis Program
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Mode dry-run : on ne modifie rien, mais on retourne une description de ce qui
+    /// serait importé / mis à jour.
+    /// </summary>
+    public static async Task<DryRunResult> DryRunPaymentAsync(
+        SqlConnection connection,
+        LegacyPaymentCsvRow csvRow,
+        bool backfillMode,
+        CancellationToken cancellationToken = default)
     {
-        Console.WriteLine($"[PAYMENTS-LOOKUP] Searching transaction: TransNumber={transNumber}, TerminalsID={terminalsId}, Date={transDateTime}");
+        var paymentType = DeterminePaymentType(csvRow);
 
-        const string sql = @"
-SELECT TOP (1) ID_TRANSACTIONS
-FROM dbo.TRANSACTIONS
-WHERE TransNumber = @n
-  AND TerminalsID = @t
-  AND CONVERT(date, TransDateTime) = @d
-ORDER BY TransDateTime DESC;";
+        // On essaie de retrouver la transaction shadow
+        var transactionId = await GetOrCreateTransactionShadowAsync(connection, csvRow, paymentType, dryRun: true, cancellationToken);
 
-        await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@n", transNumber);
-        cmd.Parameters.AddWithValue("@t", terminalsId);
-        cmd.Parameters.AddWithValue("@d", transDateTime.Date);
+        // On enrichit depuis la base legacy si besoin
+        var enrichment = await EnrichLegacyPaymentWithCardInfoAsync(connection, csvRow, cancellationToken);
 
-        var result = await cmd.ExecuteScalarAsync();
-        if (result == null || result == DBNull.Value)
+        var description = $"[{paymentType}] TxId={transactionId?.ToString() ?? "null"} " +
+                          $"TermID={csvRow.TerminalsID} Num={csvRow.TransNumber} " +
+                          $"Quantité={csvRow.TransQuantity} Pan={csvRow.CardPAN ?? enrichment?.CardPan ?? "(?)"}";
+
+        return new DryRunResult
         {
-            // Loose match on TransNumber + TerminalsID (ignore date) for debug
-            const string sqlLoose = @"
-SELECT TOP (1) ID_TRANSACTIONS, TransDateTime
-FROM dbo.TRANSACTIONS
-WHERE TransNumber = @n
-  AND TerminalsID = @t
-ORDER BY TransDateTime DESC;";
-
-            await using (var cmdLoose = new SqlCommand(sqlLoose, conn))
-            {
-                cmdLoose.Parameters.AddWithValue("@n", transNumber);
-                cmdLoose.Parameters.AddWithValue("@t", terminalsId);
-
-                await using var reader = await cmdLoose.ExecuteReaderAsync();
-                if (await reader.ReadAsync())
-                {
-                    var looseId = DbSafeReader.GetIntNullable(reader, 0);
-                    var dbDate = reader.GetDateTime(1);
-                    Console.WriteLine($"[PAYMENTS-LOOKUP] Loose match: TxID={looseId}, TxDate={dbDate}");
-                }
-                else
-                {
-                    Console.WriteLine($"[PAYMENTS-LOOKUP] NO MATCH for TransNumber={transNumber}, TerminalsID={terminalsId}, Date={transDateTime}");
-                }
-            }
-
-            return null;
-        }
-
-        var idValue = result switch
-        {
-            int i => i,
-            long l => (int)l,
-            _ => Convert.ToInt32(result)
-        };
-
-        Console.WriteLine($"[PAYMENTS-LOOKUP] Found TxID={idValue}");
-        return idValue;
-
-    }
-
-    public static async Task<PaymentDryRunAction> DryRunPaymentAsync(
-        SqlConnection conn,
-        int transactionsId,
-        DateTime transDateTime,
-        int transNumber,
-        int terminalsId,
-        string tenderCode,
-        decimal? transQuantity,
-        decimal? transSinglePriceInclSold,
-        decimal? transAmount,
-        decimal? transAmountNet,
-        decimal? transAmountTax,
-        decimal? transTaxRate,
-        string? transArticleCode,
-        string? transArticleDescription,
-        int? transDeviceAddress,
-        int? transSubDeviceAddress,
-        string? currencySymbol,
-        string? cardPan,
-        string? cardCustomerNumber,
-        string? cardNumber,
-        int? cardTankNumber,
-        int? cardsId,
-        int? customersId,
-        string? customerNumber,
-        string? customerName,
-        int? mandatorsId,
-        string? mandatorNumber,
-        string? mandatorDescription,
-        int? vehiclesId,
-        string? vehicleLicensePlate,
-        CancellationToken cancellationToken)
-    {
-        Console.WriteLine(
-            $"[PAYMENTS-DRYRUN] Candidate: TxId={transactionsId}, TransNumber={transNumber}, TerminalsID={terminalsId}, Tender={tenderCode}, Article={transArticleCode}, Device={transDeviceAddress}, SubDevice={transSubDeviceAddress}, Amount={transAmount}, Qty={transQuantity}, CardPAN={cardPan}, VehiclePlate={vehicleLicensePlate}");
-
-        var existing = await GetExistingPaymentAsync(
-            conn,
-            transactionsId,
-            transDateTime,
-            transNumber,
-            terminalsId,
-            transArticleCode,
-            transDeviceAddress,
-            transSubDeviceAddress,
-            transAmount,
-            transQuantity,
-            cancellationToken);
-
-        if (existing is null)
-        {
-            Console.WriteLine("[PAYMENTS-DRYRUN] Action: INSERT (aucun paiement existant avec cette signature).");
-            return PaymentDryRunAction.Insert;
-        }
-
-        Console.WriteLine(
-            $"[PAYMENTS-DRYRUN-BEFORE] ID_PAYMENTS={existing.IdPayments}, Qty={existing.TransQuantity}, Amount={existing.TransAmount}, Net={existing.TransAmountNet}, Tax={existing.TransAmountTax}, Rate={existing.TransTaxRate}, ArticleDesc={existing.TransArticleDescription}, Currency={existing.CurrencySymbol}, PAN={existing.CardPAN}, Plate={existing.VehicleLicensePlate}");
-
-        Console.WriteLine(
-            $"[PAYMENTS-DRYRUN-AFTER ] Qty={transQuantity}, Amount={transAmount}, Net={transAmountNet}, Tax={transAmountTax}, Rate={transTaxRate}, ArticleDesc={transArticleDescription}, Currency={currencySymbol}, PAN={cardPan}, Plate={vehicleLicensePlate}");
-
-        var wouldChange =
-               existing.TransQuantity != transQuantity
-            || existing.TransAmount != transAmount
-            || existing.TransAmountNet != transAmountNet
-            || existing.TransAmountTax != transAmountTax
-            || existing.TransTaxRate != transTaxRate
-            || existing.TransArticleDescription != transArticleDescription
-            || existing.CurrencySymbol != currencySymbol
-            || existing.CardPAN != cardPan;
-
-        if (wouldChange)
-        {
-            Console.WriteLine($"[PAYMENTS-DRYRUN] Action: UPDATE sur ID_PAYMENTS={existing.IdPayments}.");
-            return PaymentDryRunAction.Update;
-        }
-        else
-        {
-            Console.WriteLine($"[PAYMENTS-DRYRUN] Action: NO-OP (les données sont identiques, aucun UPDATE nécessaire) sur ID_PAYMENTS={existing.IdPayments}.");
-            return PaymentDryRunAction.NoOp;
-        }
-    }
-
-    private static async Task<PaymentSnapshot?> GetExistingPaymentAsync(
-        SqlConnection conn,
-        int transactionsId,
-        DateTime transDateTime,
-        int transNumber,
-        int terminalsId,
-        string? transArticleCode,
-        int? transDeviceAddress,
-        int? transSubDeviceAddress,
-        decimal? transAmount,
-        decimal? transQuantity,
-        CancellationToken cancellationToken)
-    {
-        const string sqlTemplate = @"
-SELECT TOP (1)
-       ID_PAYMENTS,
-       TransactionsID,
-       TransDateTime,
-       TransNumber,
-       TerminalsID,
-       TransQuantity,
-       TransAmount,
-       TransAmountNet,
-       TransAmountTax,
-       TransTaxRate,
-       TransArticleCode,
-       TransArticleDescription,
-       CurrencySymbol,
-       CardPAN,
-       VehicleLicensePlate
-FROM {0}
-WHERE TransactionsID = @TransactionsID
-  AND TransNumber = @TransNumber
-  AND TerminalsID = @TerminalsID
-  AND ABS(DATEDIFF(SECOND, TransDateTime, @TransDateTime)) <= 1
-  AND ISNULL(TransArticleCode, '') = ISNULL(@TransArticleCode, '')
-  AND ISNULL(TransDeviceAddress, -1) = ISNULL(@TransDeviceAddress, -1)
-  AND ISNULL(TransSubDeviceAddress, -1) = ISNULL(@TransSubDeviceAddress, -1)
-  AND ISNULL(CONVERT(decimal(18,4), TransAmount), 0) = ISNULL(CONVERT(decimal(18,4), @TransAmount), 0)
-  AND ISNULL(CONVERT(decimal(18,4), TransQuantity), 0) = ISNULL(CONVERT(decimal(18,4), @TransQuantity), 0)
-ORDER BY ID_PAYMENTS;";
-
-        var sql = string.Format(sqlTemplate, _paymentsTableName);
-
-        await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@TransactionsID", transactionsId);
-        cmd.Parameters.AddWithValue("@TransNumber", transNumber);
-        cmd.Parameters.AddWithValue("@TerminalsID", terminalsId);
-        cmd.Parameters.AddWithValue("@TransDateTime", transDateTime);
-        cmd.Parameters.AddWithValue("@TransArticleCode", (object?)transArticleCode ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@TransDeviceAddress", (object?)transDeviceAddress ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@TransSubDeviceAddress", (object?)transSubDeviceAddress ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@TransAmount", (object?)transAmount ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@TransQuantity", (object?)transQuantity ?? DBNull.Value);
-
-        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
-        if (!await reader.ReadAsync(cancellationToken))
-            return null;
-
-        return new PaymentSnapshot
-        {
-            IdPayments = DbSafeReader.GetIntNullable(reader, 0) ?? 0,
-            TransactionsId = DbSafeReader.GetIntNullable(reader, 1) ?? 0,
-            TransDateTime = reader.GetDateTime(2),
-            TransNumber = DbSafeReader.GetIntNullable(reader, 3) ?? 0,
-            TerminalsId = DbSafeReader.GetIntNullable(reader, 4) ?? 0,
-            TransQuantity = DbSafeReader.GetDecimalNullable(reader, 5),
-            TransAmount = DbSafeReader.GetDecimalNullable(reader, 6),
-            TransAmountNet = DbSafeReader.GetDecimalNullable(reader, 7),
-            TransAmountTax = DbSafeReader.GetDecimalNullable(reader, 8),
-            TransTaxRate = DbSafeReader.GetDecimalNullable(reader, 9),
-            TransArticleCode = DbSafeReader.GetStringNullable(reader, 10),
-            TransArticleDescription = DbSafeReader.GetStringNullable(reader, 11),
-            CurrencySymbol = DbSafeReader.GetStringNullable(reader, 12),
-            CardPAN = DbSafeReader.GetStringNullable(reader, 13),
-            VehicleLicensePlate = DbSafeReader.GetStringNullable(reader, 14),
+            ShouldImport = transactionId.HasValue,
+            Description = description
         };
     }
 
-    public static async Task<int> UpsertPaymentAsync(
-    SqlConnection conn,
-    SqlTransaction? tx,
-    int transactionsId,
-    DateTime transDateTime,
-    int transNumber,
-    int terminalsId,
-    string tenderCode,
-    decimal? transQuantity,
-    decimal? transSinglePriceInclSold,
-    decimal? transAmount,
-    decimal? transAmountNet,
-    decimal? transAmountTax,
-    decimal? transTaxRate,
-    int articleId,
-    string? transArticleCode,
-    string? transArticleDescription,
-    int? transDeviceAddress,
-    int? transSubDeviceAddress,
-    string? currencySymbol,
-    string? cardPan,
-    string? cardCustomerNumber,
-    string? cardNumber,
-    int? cardTankNumber,
-    int? cardsId,
-    int? customersId,
-    string? customerNumber,
-    string? customerName,
-    int? mandatorsId,
-    string? mandatorNumber,
-    string? mandatorDescription,
-    int? vehiclesId,
-    string? vehicleLicensePlate)
+    /// <summary>
+    /// Mode réel : applique les changements dans TRANSACTIONS_SHADOW et PAYMENTS_SHADOW.
+    /// </summary>
+    public static async Task<bool> ApplyPaymentFromCsvAsync(
+        SqlConnection connection,
+        LegacyPaymentCsvRow csvRow,
+        bool backfillMode,
+        CancellationToken cancellationToken = default)
     {
-        Console.WriteLine(
-            $"[PAYMENTS-MERGE] txId={transactionsId}, TransNumber={transNumber}, TerminalsID={terminalsId}, Tender={tenderCode}, Article={transArticleCode}, Device={transDeviceAddress}, SubDevice={transSubDeviceAddress}, Amount={transAmount}, Qty={transQuantity}");
+        var tx = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
 
-        const string sqlTemplate = @"
-MERGE {0} AS tgt
-USING (VALUES(
-        @TransactionsID,
-        @TransDateTime,
-        @TransNumber,
-        @TerminalsID,
-        @TenderCode,
-        @TransArticleID,
-        @TransArticleCode,
-        @TransDeviceAddress,
-        @TransSubDeviceAddress,
-        @TransAmount,
-        @TransQuantity))
-      AS src(
-        TransactionsID,
-        TransDateTime,
-        TransNumber,
-        TerminalsID,
-        TenderCode,
-        TransArticleID,
-        TransArticleCode,
-        TransDeviceAddress,
-        TransSubDeviceAddress,
-        TransAmount,
-        TransQuantity)
-    ON (
-        tgt.TransactionsID = src.TransactionsID
-    )
-WHEN MATCHED THEN
-    UPDATE SET
-        tgt.TransQuantity              = @TransQuantity,
-        tgt.TransSinglePriceInclSold   = @TransSinglePriceInclSold,
-        tgt.TransAmount                = @TransAmount,
-        tgt.TransAmountNet             = @TransAmountNet,
-        tgt.TransAmountTax             = @TransAmountTax,
-        tgt.TransTaxRate               = @TransTaxRate,
-        tgt.TransArticleID             = @TransArticleID,
-        tgt.TransArticleCode           = @TransArticleCode,
-        tgt.TransArticleDescription    = @TransArticleDescription,
-        tgt.TransDeviceAddress         = @TransDeviceAddress,
-        tgt.TransSubDeviceAddress      = @TransSubDeviceAddress,
-        tgt.CurrencySymbol             = @CurrencySymbol,
-        tgt.CardPAN                    = @CardPAN,
-        tgt.CardsID                    = @CardsID,
-        tgt.CardCustomerNumber         = @CardCustomerNumber,
-        tgt.CardNumber                 = @CardNumber,
-        tgt.CardTankNumber             = @CardTankNumber,
-        tgt.CustomersID                = @CustomersID,
-        tgt.CustomerNumber             = @CustomerNumber,
-        tgt.CustomerName               = @CustomerName,
-        tgt.MandatorsID                = @MandatorsID,
-        tgt.MandatorNumber             = @MandatorNumber,
-        tgt.MandatorDescription        = @MandatorDescription,
-        tgt.VehiclesID                 = @VehiclesID,
-        tgt.VehicleLicensePlate        = @VehicleLicensePlate
-WHEN NOT MATCHED THEN
-    INSERT (
-            TransactionsID,
-            TransDateTime,
-            TransNumber,
-            TerminalsID,
-            TenderCode,
-            TransQuantity,
-            TransSinglePriceInclSold,
-            TransAmount,
-            TransAmountNet,
-            TransAmountTax,
-            TransTaxRate,
-            TransArticleID,
-            TransArticleCode,
-            TransArticleDescription,
-            TransDeviceAddress,
-            TransSubDeviceAddress,
-            CurrencySymbol,
-            CardPAN,
-            CardsID,
-            CardCustomerNumber,
-            CardNumber,
-            CardTankNumber,
-            CustomersID,
-            CustomerNumber,
-            CustomerName,
-            MandatorsID,
-            MandatorNumber,
-            MandatorDescription,
-            VehiclesID,
-            VehicleLicensePlate,
-            Number,
-            ModifiedFlag,
-            FleetImport)
-    VALUES (
-            @TransactionsID,
-            @TransDateTime,
-            @TransNumber,
-            @TerminalsID,
-            @TenderCode,
-            @TransQuantity,
-            @TransSinglePriceInclSold,
-            @TransAmount,
-            @TransAmountNet,
-            @TransAmountTax,
-            @TransTaxRate,
-            @TransArticleID,
-            @TransArticleCode,
-            @TransArticleDescription,
-            @TransDeviceAddress,
-            @TransSubDeviceAddress,
-            @CurrencySymbol,
-            @CardPAN,
-            @CardsID,
-            @CardCustomerNumber,
-            @CardNumber,
-            @CardTankNumber,
-            @CustomersID,
-            @CustomerNumber,
-            @CustomerName,
-            @MandatorsID,
-            @MandatorNumber,
-            @MandatorDescription,
-            @VehiclesID,
-            @VehicleLicensePlate,
-            DEFAULT,    -- Number
-            DEFAULT,    -- ModifiedFlag
-            DEFAULT);"; 
-
-    var sql = string.Format(sqlTemplate, _paymentsTableName);
-
-        await using var cmd = new SqlCommand(sql, conn);
-        if (tx != null)
-        {
-            cmd.Transaction = tx;
-        }
-
-        cmd.Parameters.AddWithValue("@TransactionsID", transactionsId);
-        cmd.Parameters.AddWithValue("@TransDateTime", transDateTime);
-        cmd.Parameters.AddWithValue("@TransNumber", transNumber);
-        cmd.Parameters.AddWithValue("@TerminalsID", terminalsId);
-        cmd.Parameters.AddWithValue("@TenderCode", tenderCode);
-
-        cmd.Parameters.AddWithValue("@TransArticleID", articleId);
-        cmd.Parameters.AddWithValue("@TransArticleCode", (object?)transArticleCode ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@TransDeviceAddress", (object?)transDeviceAddress ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@TransSubDeviceAddress", (object?)transSubDeviceAddress ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@TransAmount", (object?)transAmount ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@TransQuantity", (object?)transQuantity ?? DBNull.Value);
-
-        cmd.Parameters.AddWithValue("@TransSinglePriceInclSold", (object?)transSinglePriceInclSold ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@TransAmountNet", (object?)transAmountNet ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@TransAmountTax", (object?)transAmountTax ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@TransTaxRate", (object?)transTaxRate ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@TransArticleDescription", (object?)transArticleDescription ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@CurrencySymbol", (object?)currencySymbol ?? DBNull.Value);
-
-        cmd.Parameters.AddWithValue("@CardPAN", (object?)cardPan ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@CardsID", (object?)cardsId ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@CardCustomerNumber", (object?)cardCustomerNumber ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@CardNumber", (object?)cardNumber ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@CardTankNumber", (object?)cardTankNumber ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@CustomersID", (object?)customersId ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@CustomerNumber", (object?)customerNumber ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@CustomerName", (object?)customerName ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@MandatorsID", (object?)mandatorsId ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@MandatorNumber", (object?)mandatorNumber ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@MandatorDescription", (object?)mandatorDescription ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@VehiclesID", (object?)vehiclesId ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@VehicleLicensePlate", (object?)vehicleLicensePlate ?? DBNull.Value);
-
-        var rows = await cmd.ExecuteNonQueryAsync();
-        Console.WriteLine($"[PAYMENTS-MERGE] Rows affected = {rows}");
-        return rows;
-    }
-
-
-    public static string ResolveTenderCode(IConfiguration cfg, CsvReader csv)
-    {
-        var mapping = cfg.GetSection("Import").GetSection("TenderMapping");
-        var cardCode = mapping["Card"] ?? "UNKN";
-        var cashCode = mapping["Cash"] ?? "UNKN";
-        var voucherCode = mapping["Voucher"] ?? "UNKN";
-        var unknownCode = mapping["Unknown"] ?? "UNKN";
-
-        if (ReadBool(csv, "Payment_Card"))
-            return cardCode;
-
-        if (ReadBool(csv, "Payment_Cash"))
-            return cashCode;
-
-        if (ReadBool(csv, "Payment_Voucher"))
-            return voucherCode;
-
-        return unknownCode;
-    }
-
-    private static bool ReadBool(CsvReader csv, string fieldName)
-    {
         try
         {
-            var raw = csv.GetField(fieldName);
-            if (string.IsNullOrWhiteSpace(raw))
+            var paymentType = DeterminePaymentType(csvRow);
+
+            var transactionId = await GetOrCreateTransactionShadowAsync(connection, csvRow, paymentType, dryRun: false, cancellationToken);
+            if (!transactionId.HasValue)
+            {
+                await tx.RollbackAsync(cancellationToken);
                 return false;
+            }
 
-            if (bool.TryParse(raw, out var value))
-                return value;
+            var enrichment = await EnrichLegacyPaymentWithCardInfoAsync(connection, csvRow, cancellationToken);
 
-            return raw == "1";
+            await InsertOrUpdatePaymentShadowAsync(connection, tx, csvRow, transactionId.Value, paymentType, enrichment, backfillMode, cancellationToken);
+
+            await tx.CommitAsync(cancellationToken);
+            return true;
         }
         catch
         {
-            return false;
+            await tx.RollbackAsync(cancellationToken);
+            throw;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Déduction du type de paiement (mode legacy / SaaS, etc.)
+    // -------------------------------------------------------------------------
+
+    private static PaymentType DeterminePaymentType(LegacyPaymentCsvRow row)
+    {
+        // Si le CSV donne un hint (PaymentTypeHint), on l'utilise
+        if (!string.IsNullOrWhiteSpace(row.PaymentTypeHint))
+        {
+            var hint = row.PaymentTypeHint.Trim().ToUpperInvariant();
+            return hint switch
+            {
+                "LEGACY" => PaymentType.Legacy,
+                "BACKFILL" => PaymentType.Backfill,
+                "SAAS" => PaymentType.Saas,
+                _ => PaymentType.Unknown
+            };
+        }
+
+        // Fallback : heuristiques simples
+        if (row.TransDateTime is { } dt && dt < new DateTime(2025, 9, 25))
+            return PaymentType.Legacy;
+
+        if (row.TransDateTime is { } dt2 && dt2 >= new DateTime(2025, 9, 25))
+            return PaymentType.Saas;
+
+        return PaymentType.Unknown;
+    }
+
+    // -------------------------------------------------------------------------
+    // Transactions shadow – création / récupération
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Retrouve (ou crée) une ligne dans TRANSACTIONS_SHADOW correspondant à la transaction
+    /// décrite par le CSV.
+    /// </summary>
+    public static async Task<int?> GetOrCreateTransactionShadowAsync(
+        SqlConnection connection,
+        LegacyPaymentCsvRow csvRow,
+        PaymentType paymentType,
+        bool dryRun,
+        CancellationToken cancellationToken = default)
+    {
+        if (!csvRow.TransDateTime.HasValue || !csvRow.TransNumber.HasValue || !csvRow.TerminalsID.HasValue)
+            return null;
+
+        var transDateTime = csvRow.TransDateTime.Value;
+        var transNumber = csvRow.TransNumber.Value;
+        var terminalsId = csvRow.TerminalsID.Value;
+
+        // 1) On cherche la transaction_shadow existante
+        const string selectSql = @"
+SELECT TransactionsID
+FROM dbo.TRANSACTIONS_SHADOW
+WHERE TransDateTime   = @TransDateTime
+  AND TransNumber     = @TransNumber
+  AND TerminalsID     = @TerminalsID;";
+
+        await using (var selectCmd = new SqlCommand(selectSql, connection))
+        {
+            selectCmd.Parameters.AddWithValue("@TransDateTime", transDateTime);
+            selectCmd.Parameters.AddWithValue("@TransNumber", transNumber);
+            selectCmd.Parameters.AddWithValue("@TerminalsID", terminalsId);
+
+            var existingId = await selectCmd.ExecuteScalarAsync(cancellationToken);
+            if (existingId is int id)
+                return id;
+        }
+
+        if (dryRun)
+        {
+            // En dry-run, on ne crée rien, mais on signale que ça n'existe pas
+            return null;
+        }
+
+        // 2) Sinon, on va chercher dans TRANSACTIONS legacy, pour recopier la ligne
+        const string legacySql = @"
+SELECT TOP(1) *
+FROM dbo.TRANSACTIONS
+WHERE TransDateTime = @TransDateTime
+  AND TransNumber   = @TransNumber
+  AND TerminalsID   = @TerminalsID;";
+
+        await using var legacyCmd = new SqlCommand(legacySql, connection);
+        legacyCmd.Parameters.AddWithValue("@TransDateTime", transDateTime);
+        legacyCmd.Parameters.AddWithValue("@TransNumber", transNumber);
+        legacyCmd.Parameters.AddWithValue("@TerminalsID", terminalsId);
+
+        await using var reader = await legacyCmd.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            // Pas de transaction legacy correspondante : on ne fait rien
+            return null;
+        }
+
+        // On crée la transaction_shadow à partir de la transaction legacy
+        const string insertSql = @"
+INSERT INTO dbo.TRANSACTIONS_SHADOW
+(
+    TransDateTime,
+    TransNumber,
+    TerminalsID,
+    TerminalsStationCode,
+    TerminalNumber,
+    TransStatus,
+    TransWasExported,
+    TransPollDateTime
+    -- autres colonnes si nécessaire
+)
+OUTPUT INSERTED.TransactionsID
+VALUES
+(
+    @TransDateTime,
+    @TransNumber,
+    @TerminalsID,
+    @TerminalsStationCode,
+    @TerminalNumber,
+    @TransStatus,
+    @TransWasExported,
+    @TransPollDateTime
+);";
+
+        var termStationCode = reader["TerminalsStationCode"] as int? ?? 0;
+        var terminalNumber = reader["TerminalNumber"] as int? ?? 0;
+        var transStatus = reader["TransStatus"] as int? ?? 0;
+        var transWasExported = reader["TransWasExported"] as string ?? "N";
+        var transPollDateTime = reader["TransPollDateTime"] as DateTime? ?? transDateTime;
+
+        await reader.CloseAsync();
+
+        await using var insertCmd = new SqlCommand(insertSql, connection);
+        insertCmd.Parameters.AddWithValue("@TransDateTime", transDateTime);
+        insertCmd.Parameters.AddWithValue("@TransNumber", transNumber);
+        insertCmd.Parameters.AddWithValue("@TerminalsID", terminalsId);
+        insertCmd.Parameters.AddWithValue("@TerminalsStationCode", termStationCode);
+        insertCmd.Parameters.AddWithValue("@TerminalNumber", terminalNumber);
+        insertCmd.Parameters.AddWithValue("@TransStatus", transStatus);
+        insertCmd.Parameters.AddWithValue("@TransWasExported", transWasExported);
+        insertCmd.Parameters.AddWithValue("@TransPollDateTime", transPollDateTime);
+
+        var newIdObj = await insertCmd.ExecuteScalarAsync(cancellationToken);
+        return newIdObj as int?;
+    }
+
+    // -------------------------------------------------------------------------
+    // Enrichissement des paiements (CARDS / VEHICLES / EMPLOYEES)
+    // -------------------------------------------------------------------------
+
+    public static async Task<PaymentEnrichment?> EnrichLegacyPaymentWithCardInfoAsync(
+        SqlConnection connection,
+        LegacyPaymentCsvRow row,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(row.CardPAN))
+            return null;
+
+        var cardInfo = await CardEnrichmentService.GetCardVehicleMappingAsync(connection, transaction: null, row.CardPAN!, cancellationToken);
+        if (cardInfo == null)
+            return null;
+
+        return new PaymentEnrichment
+        {
+            CardPan = row.CardPAN,
+            CardsId = cardInfo.CardsId,
+            CardCustomerNumber = cardInfo.CardCustomerNumber,
+            CardNumber = cardInfo.CardNumber,
+            CardExtNumber = cardInfo.CardExtNumber,
+            CardSystem = cardInfo.CardSystem,
+            CardTankNumber = cardInfo.CardTankNumber,
+            CardLimit = cardInfo.CardLimit,
+            CardOnHand = cardInfo.CardOnHand,
+            CardValidFrom = cardInfo.CardValidFrom,
+            CardValidTo = cardInfo.CardValidTo,
+            VehiclesId = cardInfo.VehiclesId,
+            VehicleLicensePlate = cardInfo.VehicleLicensePlate,
+            EmployeesId = cardInfo.EmployeesId,
+            EmployeeNumber = cardInfo.EmployeeNumber,
+            EmployeeName = cardInfo.EmployeeName
+        };
+    }
+
+    // -------------------------------------------------------------------------
+    // Insertion / mise à jour de PAYMENTS_SHADOW
+    // -------------------------------------------------------------------------
+
+    private static async Task InsertOrUpdatePaymentShadowAsync(
+        SqlConnection connection,
+        SqlTransaction transaction,
+        LegacyPaymentCsvRow row,
+        int transactionsIdShadow,
+        PaymentType paymentType,
+        PaymentEnrichment? enrichment,
+        bool backfillMode,
+        CancellationToken cancellationToken)
+    {
+        // On regarde si un paiement shadow existe déjà pour cette transaction
+        const string selectSql = @"
+SELECT ID_PAYMENTS
+FROM dbo.PAYMENTS_SHADOW
+WHERE TransactionsID = @TransactionsID;";
+
+        int? existingPaymentId = null;
+
+        await using (var selectCmd = new SqlCommand(selectSql, connection, transaction))
+        {
+            selectCmd.Parameters.AddWithValue("@TransactionsID", transactionsIdShadow);
+            var scalar = await selectCmd.ExecuteScalarAsync(cancellationToken);
+            if (scalar is int id)
+                existingPaymentId = id;
+        }
+
+        if (existingPaymentId.HasValue && !backfillMode)
+        {
+            // Déjà présent, et on n'est pas en backfill => on ne touche pas
+            return;
+        }
+
+        // Construction des valeurs à insérer / mettre à jour
+        var transDateTime = row.TransDateTime ?? DateTime.MinValue;
+        var transNumber = row.TransNumber ?? 0;
+        var terminalsId = row.TerminalsID ?? 0;
+
+        var transQuantity = row.TransQuantity ?? 0m;
+        var transSinglePrice = row.TransSinglePriceInclSold ?? 0m;
+        var transAmount = row.TransAmount ?? 0m;
+        var transAmountNet = row.TransAmountNet ?? 0m;
+        var transAmountTax = row.TransAmountTax ?? 0m;
+        var transTaxRate = row.TransTaxRate ?? 0m;
+
+        var pan = row.CardPAN ?? enrichment?.CardPan;
+        var cardLimit = enrichment?.CardLimit ?? 0m;
+        var cardOnHand = enrichment?.CardOnHand ?? 0m;
+
+        if (existingPaymentId.HasValue)
+        {
+            // UPDATE
+            const string updateSql = @"
+UPDATE dbo.PAYMENTS_SHADOW
+SET TransDateTime                = @TransDateTime,
+    TransNumber                  = @TransNumber,
+    TerminalsID                  = @TerminalsID,
+    TransQuantity                = @TransQuantity,
+    TransSinglePriceInclSold     = @TransSinglePriceInclSold,
+    TransAmount                  = @TransAmount,
+    TransAmountNet               = @TransAmountNet,
+    TransAmountTax               = @TransAmountTax,
+    TransTaxRate                 = @TransTaxRate,
+    CardPAN                      = @CardPAN,
+    CardLimit                    = @CardLimit,
+    CardOnHand                   = @CardOnHand,
+    LastChangedDateTime          = SYSUTCDATETIME(),
+    LastChangedByUser            = N'HecpollSyncDb'
+WHERE ID_PAYMENTS = @Id;";
+
+            await using var updateCmd = new SqlCommand(updateSql, connection, transaction);
+            updateCmd.Parameters.AddWithValue("@Id", existingPaymentId.Value);
+            updateCmd.Parameters.AddWithValue("@TransDateTime", transDateTime);
+            updateCmd.Parameters.AddWithValue("@TransNumber", transNumber);
+            updateCmd.Parameters.AddWithValue("@TerminalsID", terminalsId);
+            updateCmd.Parameters.AddWithValue("@TransQuantity", transQuantity);
+            updateCmd.Parameters.AddWithValue("@TransSinglePriceInclSold", transSinglePrice);
+            updateCmd.Parameters.AddWithValue("@TransAmount", transAmount);
+            updateCmd.Parameters.AddWithValue("@TransAmountNet", transAmountNet);
+            updateCmd.Parameters.AddWithValue("@TransAmountTax", transAmountTax);
+            updateCmd.Parameters.AddWithValue("@TransTaxRate", transTaxRate);
+            updateCmd.Parameters.AddWithValue("@CardPAN", (object?)pan ?? DBNull.Value);
+            updateCmd.Parameters.AddWithValue("@CardLimit", cardLimit);
+            updateCmd.Parameters.AddWithValue("@CardOnHand", cardOnHand);
+
+            await updateCmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+        else
+        {
+            // INSERT
+            const string insertSql = @"
+INSERT INTO dbo.PAYMENTS_SHADOW
+(
+    TransactionsID,
+    TransDateTime,
+    TransNumber,
+    TerminalsID,
+    TransQuantity,
+    TransSinglePriceInclSold,
+    TransAmount,
+    TransAmountNet,
+    TransAmountTax,
+    TransTaxRate,
+    CardPAN,
+    CardLimit,
+    CardOnHand,
+    LastChangedDateTime,
+    LastChangedByUser
+)
+VALUES
+(
+    @TransactionsID,
+    @TransDateTime,
+    @TransNumber,
+    @TerminalsID,
+    @TransQuantity,
+    @TransSinglePriceInclSold,
+    @TransAmount,
+    @TransAmountNet,
+    @TransAmountTax,
+    @TransTaxRate,
+    @CardPAN,
+    @CardLimit,
+    @CardOnHand,
+    SYSUTCDATETIME(),
+    N'HecpollSyncDb'
+);";
+
+            await using var insertCmd = new SqlCommand(insertSql, connection, transaction);
+            insertCmd.Parameters.AddWithValue("@TransactionsID", transactionsIdShadow);
+            insertCmd.Parameters.AddWithValue("@TransDateTime", transDateTime);
+            insertCmd.Parameters.AddWithValue("@TransNumber", transNumber);
+            insertCmd.Parameters.AddWithValue("@TerminalsID", terminalsId);
+            insertCmd.Parameters.AddWithValue("@TransQuantity", transQuantity);
+            insertCmd.Parameters.AddWithValue("@TransSinglePriceInclSold", transSinglePrice);
+            insertCmd.Parameters.AddWithValue("@TransAmount", transAmount);
+            insertCmd.Parameters.AddWithValue("@TransAmountNet", transAmountNet);
+            insertCmd.Parameters.AddWithValue("@TransAmountTax", transAmountTax);
+            insertCmd.Parameters.AddWithValue("@TransTaxRate", transTaxRate);
+            insertCmd.Parameters.AddWithValue("@CardPAN", (object?)pan ?? DBNull.Value);
+            insertCmd.Parameters.AddWithValue("@CardLimit", cardLimit);
+            insertCmd.Parameters.AddWithValue("@CardOnHand", cardOnHand);
+
+            await insertCmd.ExecuteNonQueryAsync(cancellationToken);
         }
     }
 }
 
-internal sealed class CardDriverVehicleMapRow
+// -----------------------------------------------------------------------------
+// Types utilitaires
+// -----------------------------------------------------------------------------
+
+public enum PaymentType
 {
-    public string DriverPan { get; init; } = default!;
-    public int TransactionsId { get; init; }
-    public int TransNumber { get; init; }
-    public DateTime TransDateTime { get; init; }
+    Unknown = 0,
+    Legacy = 1,
+    Backfill = 2,
+    Saas = 3
+}
 
-    public int VehicleCardId { get; init; }
-    public string VehicleCardCustomer { get; init; } = default!;
-    public string VehicleCardNumber { get; init; } = default!;
-    public string VehicleCardPan { get; init; } = default!;
+public sealed class DryRunResult
+{
+    public bool ShouldImport { get; set; }
+    public string? Description { get; set; }
+}
 
-    public int? VehicleId { get; init; }
-    public string? VehiclePlate { get; init; }
+public sealed class PaymentEnrichment
+{
+    public string? CardPan { get; set; }
+    public int? CardsId { get; set; }
+    public string? CardCustomerNumber { get; set; }
+    public string? CardNumber { get; set; }
+    public string? CardExtNumber { get; set; }
+    public string? CardSystem { get; set; }
+    public string? CardTankNumber { get; set; }
+    public decimal CardLimit { get; set; }
+    public decimal CardOnHand { get; set; }
+    public DateTime? CardValidFrom { get; set; }
+    public DateTime? CardValidTo { get; set; }
 
-    public int? VehicleCustomersId { get; init; }
-    public string? VehicleCustomerNumber { get; init; }
-    public string? VehicleCustomerName { get; init; }
+    public int? VehiclesId { get; set; }
+    public string? VehicleLicensePlate { get; set; }
 
-    public int? MandatorsId { get; init; }
-    public string? MandatorNumber { get; init; }
-    public string? MandatorDescription { get; init; }
-
-    public int? VehicleContractId { get; init; }
+    public int? EmployeesId { get; set; }
+    public string? EmployeeNumber { get; set; }
+    public string? EmployeeName { get; set; }
 }
