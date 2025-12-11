@@ -1,15 +1,16 @@
-﻿using System.Data;
+using System.Data;
 using System.Globalization;
 using System.Text;
-using System.Linq;
 using CsvHelper;
 using CsvHelper.Configuration;
 using Microsoft.Data.SqlClient;
 
+namespace Hecpoll.Sync;
+
 internal static class CsvToShadowImporter
 {
-    private const string TransactionsShadowTable = "[dbo].[TRANSACTIONS_SHADOW]";
-    private const string PaymentsShadowTable = "[dbo].[PAYMENTS_SHADOW]";
+    private const string TransactionsTable = "[dbo].[TRANSACTIONS]";
+    private const string PaymentsTable = "[dbo].[PAYMENTS]";
 
     private sealed record TerminalInfo(
         int Id,
@@ -50,30 +51,42 @@ internal static class CsvToShadowImporter
         public Dictionary<string, int> ContractsByNumber { get; } =
             new(StringComparer.OrdinalIgnoreCase);
 
-        // VEHICLES : LicensePlate -> ID_VEHICLES
+        // VEHICLES : LicensePlate -> ID_VEHICLES (normalisé)
         public Dictionary<string, int> VehiclesByPlate { get; } =
             new(StringComparer.OrdinalIgnoreCase);
 
-        // CARDS : Number -> ID_CARDS
+        // CARDS : Number -> ID_CARDS (normalisé)
         public Dictionary<string, int> CardsByNumber { get; } =
             new(StringComparer.OrdinalIgnoreCase);
     }
 
-    public static async Task ImportAsync(SqlConnection connection, string ecpolCsvPath)
+    public static async Task ImportAsync(SqlConnection connection, string csvPath, CancellationToken cancellationToken = default)
     {
-        Logger.Info("Import", "Début de l'import du CSV ECPOL vers les tables shadow.",
-            new { Fichier = ecpolCsvPath });
+        Logger.Info("Import", "Début de l'import du CSV HECPOLL SAAS vers les tables TRANSACTIONS/PAYMENTS.",
+            new { Fichier = csvPath });
 
-        using var transaction = connection.BeginTransaction();
+        await using SqlTransaction transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
 
-        // 1. Chargement des données de référence (STATIONS, TERMINALS, TANKS)
-        var referenceData = await LoadReferenceDataAsync(connection, transaction);
+        // On récupère les max ID actuels dans les vraies tables pour éviter les collisions
+        var maxTransId = await GetMaxIdAsync(connection, transaction, TransactionsTable, "ID_TRANSACTIONS", cancellationToken);
+        var maxPayId = await GetMaxIdAsync(connection, transaction, PaymentsTable, "ID_PAYMENTS", cancellationToken);
+
+        var nextTransId = maxTransId;
+        var nextPayId = maxPayId;
+
+        // 1. Chargement des données de référence (STATIONS, TERMINALS, TANKS, CUSTOMERS, CONTRACTS, VEHICLES, CARDS)
+        var referenceData = await LoadReferenceDataAsync(connection, transaction, cancellationToken);
+
+        // 1.bis. Chargement des clés de transactions déjà présentes en base
+        var existingKeys = await LoadExistingTransactionKeysAsync(connection, transaction, cancellationToken);
+        Logger.Info("Import", "Clés de transactions existantes chargées.",
+            new { existingKeys.Count });
 
         // 2. Création des DataTable à partir du schéma SQL (SELECT TOP 0)
-        var transactionsTable = CreateEmptyTableFromSchema(connection, transaction, TransactionsShadowTable);
-        var paymentsTable = CreateEmptyTableFromSchema(connection, transaction, PaymentsShadowTable);
+        var transactionsTable = CreateEmptyTableFromSchema(connection, transaction, TransactionsTable);
+        var paymentsTable = CreateEmptyTableFromSchema(connection, transaction, PaymentsTable);
 
-        // 3. Lecture du CSV ECPOL
+        // 3. Lecture du CSV HECPOLL SAAS
         var config = new CsvConfiguration(CultureInfo.InvariantCulture)
         {
             Delimiter = ";",
@@ -82,69 +95,92 @@ internal static class CsvToShadowImporter
             BadDataFound = args =>
             {
                 var row = args.Context?.Parser?.Row ?? 0;
-                Logger.Warning("CSV", "Donnée invalide dans le CSV ECPOL.",
+                Logger.Warning("CSV", "Donnée invalide dans le CSV HECPOLL SAAS.",
                     new { Row = row, args.RawRecord });
             },
             MissingFieldFound = null
         };
 
-        int logicalId = 0;
         int lignes = 0;
+        int lignesInserees = 0;
+        int lignesIgnorees = 0;
 
-        using (var reader = new StreamReader(ecpolCsvPath, Encoding.UTF8))
+        using (var reader = new StreamReader(csvPath, Encoding.UTF8))
         using (var csv = new CsvReader(reader, config))
         {
             // 1) Lire la première ligne (l'entête)
             if (!await csv.ReadAsync())
-            {
-                throw new InvalidOperationException("Le fichier CSV ECPOL est vide ou illisible.");
-            }
+                throw new InvalidOperationException("Le fichier CSV HECPOLL SAAS est vide ou illisible.");
 
             // 2) Indiquer à CsvHelper que cette ligne est l'entête
             csv.ReadHeader();
 
-            Logger.Info("Import", "Entête du CSV ECPOL lue.",
+            Logger.Info("Import", "Entête du CSV HECPOLL SAAS lue.",
                 new { Colonnes = string.Join(";", csv.HeaderRecord ?? Array.Empty<string>()) });
 
             // 3) Maintenant on peut lire les lignes de données
             while (await csv.ReadAsync())
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 lignes++;
-                logicalId++;
 
                 var rowNumber = csv.Context?.Parser?.Row ?? 0;
 
                 var txRow = transactionsTable.NewRow();
-                var payRow = paymentsTable.NewRow();
 
-                MapTransactionRow(csv, referenceData, txRow, logicalId, rowNumber);
-                MapPaymentRow(csv, referenceData, payRow, logicalId, rowNumber);
+                // On génère un ID de transaction
+                nextTransId++;
+                var transId = nextTransId;
+
+                // Remplit la ligne transaction
+                MapTransactionRow(csv, referenceData, txRow, transId, rowNumber);
+
+                // Clé utilisée par l'index unique : (TransDateTime, TransNumber, DeviceAddress)
+                var transDateTime = (DateTime)txRow["TransDateTime"];
+                var transNumber = (int)txRow["TransNumber"];
+                var devObj = txRow["DeviceAddress"];
+                var dev = devObj == DBNull.Value ? -1 : (int)devObj;
+
+                var key = (transDateTime, transNumber, dev);
+
+                if (existingKeys.Contains(key))
+                {
+                    // Transaction déjà connue en base -> on ignore cette ligne (et son payment)
+                    lignesIgnorees++;
+                    continue;
+                }
+
+                existingKeys.Add(key);
+
+                // Nouvelle transaction : on crée le paiement associé
+                var payRow = paymentsTable.NewRow();
+                nextPayId++;
+                var payId = nextPayId;
+
+                MapPaymentRow(csv, referenceData, payRow, payId, transId, rowNumber);
 
                 transactionsTable.Rows.Add(txRow);
                 paymentsTable.Rows.Add(payRow);
+                lignesInserees++;
             }
         }
 
-        Logger.Info("Import", "Lecture du CSV ECPOL terminée.",
-            new { Lignes = lignes });
+        Logger.Info("Import", "Lecture du CSV HECPOLL SAAS terminée.",
+            new { LignesLues = lignes, LignesInserees = lignesInserees, LignesIgnorees = lignesIgnorees });
 
-        // 4. TRUNCATE des tables shadow
-        await TruncateTableAsync(connection, transaction, TransactionsShadowTable);
-        await TruncateTableAsync(connection, transaction, PaymentsShadowTable);
+        // 4. Bulk copy vers les tables cibles en conservant les IDs
+        BulkInsert(transaction, transactionsTable, TransactionsTable);
+        BulkInsert(transaction, paymentsTable, PaymentsTable);
 
-        // 5. Bulk copy des deux DataTable
-        BulkInsert(transaction, transactionsTable, TransactionsShadowTable);
-        BulkInsert(transaction, paymentsTable, PaymentsShadowTable);
+        await transaction.CommitAsync(cancellationToken);
 
-        transaction.Commit();
-
-        Logger.Info("Import", "Import ECPOL → *_SHADOW terminé.",
+        Logger.Info("Import", "Import CSV HECPOLL SAAS vers TRANSACTIONS/PAYMENTS terminé.",
             new { LignesTransactions = transactionsTable.Rows.Count, LignesPayments = paymentsTable.Rows.Count });
     }
 
     #region Reference data
 
-    private static async Task<ReferenceData> LoadReferenceDataAsync(SqlConnection connection, SqlTransaction transaction)
+    private static async Task<ReferenceData> LoadReferenceDataAsync(SqlConnection connection, SqlTransaction transaction, CancellationToken cancellationToken)
     {
         var data = new ReferenceData();
 
@@ -154,9 +190,9 @@ internal static class CsvToShadowImporter
                    "FROM dbo.STATIONS s " +
                    "LEFT JOIN dbo.MANDATORS m ON m.ID_MANDATORS = s.MandatorsID;",
                    connection, transaction))
-        using (var reader = await cmd.ExecuteReaderAsync())
+        using (var reader = await cmd.ExecuteReaderAsync(cancellationToken))
         {
-            while (await reader.ReadAsync())
+            while (await reader.ReadAsync(cancellationToken))
             {
                 var stationId = reader.GetInt32(0);
                 var stationCode = reader.GetString(1);
@@ -177,9 +213,9 @@ internal static class CsvToShadowImporter
         using (var cmd = new SqlCommand(
                    "SELECT ID_TERMINALS, StationsID, Code, Number, TerminalNumber FROM dbo.TERMINALS;",
                    connection, transaction))
-        using (var reader = await cmd.ExecuteReaderAsync())
+        using (var reader = await cmd.ExecuteReaderAsync(cancellationToken))
         {
-            while (await reader.ReadAsync())
+            while (await reader.ReadAsync(cancellationToken))
             {
                 var id = reader.GetInt32(0);
                 var stationsId = reader.GetInt32(1);
@@ -203,9 +239,9 @@ internal static class CsvToShadowImporter
         using (var cmd = new SqlCommand(
                    "SELECT ID_TANKS, StationsID, ArticlesID, Number FROM dbo.TANKS;",
                    connection, transaction))
-        using (var reader = await cmd.ExecuteReaderAsync())
+        using (var reader = await cmd.ExecuteReaderAsync(cancellationToken))
         {
-            while (await reader.ReadAsync())
+            while (await reader.ReadAsync(cancellationToken))
             {
                 var tanksId = reader.GetInt32(0); // ID_TANKS
                 var stationId = reader.GetInt32(1); // StationsID
@@ -222,9 +258,9 @@ internal static class CsvToShadowImporter
         using (var cmd = new SqlCommand(
                    "SELECT ID_CUSTOMERS, Number, Company, Firstname, Lastname FROM dbo.CUSTOMERS;",
                    connection, transaction))
-        using (var reader = await cmd.ExecuteReaderAsync())
+        using (var reader = await cmd.ExecuteReaderAsync(cancellationToken))
         {
-            while (await reader.ReadAsync())
+            while (await reader.ReadAsync(cancellationToken))
             {
                 var id = reader.GetInt32(0);
                 var number = reader.GetString(1); // CUSTOMERS.Number
@@ -250,9 +286,9 @@ internal static class CsvToShadowImporter
         using (var cmd = new SqlCommand(
                    "SELECT ID_CONTRACTS, Number FROM dbo.CONTRACTS;",
                    connection, transaction))
-        using (var reader = await cmd.ExecuteReaderAsync())
+        using (var reader = await cmd.ExecuteReaderAsync(cancellationToken))
         {
-            while (await reader.ReadAsync())
+            while (await reader.ReadAsync(cancellationToken))
             {
                 var id = reader.GetInt32(0);
                 var number = reader.GetString(1); // CONTRACTS.Number
@@ -261,13 +297,13 @@ internal static class CsvToShadowImporter
             }
         }
 
-        // VEHICLES : LicensePlate -> ID_VEHICLES
+        // VEHICLES : LicensePlate -> ID_VEHICLES (normalisé)
         using (var cmd = new SqlCommand(
                    "SELECT ID_VEHICLES, LicensePlate FROM dbo.VEHICLES;",
                    connection, transaction))
-        using (var reader = await cmd.ExecuteReaderAsync())
+        using (var reader = await cmd.ExecuteReaderAsync(cancellationToken))
         {
-            while (await reader.ReadAsync())
+            while (await reader.ReadAsync(cancellationToken))
             {
                 var id = reader.GetInt32(0);
                 var plate = reader.IsDBNull(1) ? string.Empty : reader.GetString(1);
@@ -284,9 +320,9 @@ internal static class CsvToShadowImporter
         using (var cmd = new SqlCommand(
                    "SELECT ID_CARDS, Number FROM dbo.CARDS;",
                    connection, transaction))
-        using (var reader = await cmd.ExecuteReaderAsync())
+        using (var reader = await cmd.ExecuteReaderAsync(cancellationToken))
         {
-            while (await reader.ReadAsync())
+            while (await reader.ReadAsync(cancellationToken))
             {
                 var id = reader.GetInt32(0);
                 var number = reader.IsDBNull(1) ? string.Empty : reader.GetString(1);
@@ -300,42 +336,75 @@ internal static class CsvToShadowImporter
         }
 
         Logger.Info("ReferenceData", "Tables de référence chargées.",
-    new
-    {
-        Stations = data.StationByCode.Count,
-        StationsAvecTerminaux = data.TerminalsByStationId.Count,
-        CombinaisonsTanks = data.TankNumberByStationAndArticleId.Count,
-        Customers = data.CustomersByNumber.Count,
-        Contracts = data.ContractsByNumber.Count,
-        Vehicles = data.VehiclesByPlate.Count,
-        Cards = data.CardsByNumber.Count
-    });
-
+            new
+            {
+                Stations = data.StationByCode.Count,
+                StationsAvecTerminaux = data.TerminalsByStationId.Count,
+                CombinaisonsTanks = data.TankNumberByStationAndArticleId.Count,
+                Customers = data.CustomersByNumber.Count,
+                Contracts = data.ContractsByNumber.Count,
+                Vehicles = data.VehiclesByPlate.Count,
+                Cards = data.CardsByNumber.Count
+            });
 
         return data;
     }
 
+    private static async Task<HashSet<(DateTime transDateTime, int transNumber, int deviceAddress)>> LoadExistingTransactionKeysAsync(
+    SqlConnection connection,
+    SqlTransaction transaction,
+    CancellationToken cancellationToken)
+    {
+        var keys = new HashSet<(DateTime, int, int)>();
+
+        const string sql = @"
+SELECT TransDateTime,
+       TransNumber,
+       ISNULL(DeviceAddress, -1) AS DeviceAddress
+FROM dbo.TRANSACTIONS;";
+
+        await using var cmd = new SqlCommand(sql, connection, transaction);
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var dt = reader.GetDateTime(0);
+            var num = reader.GetInt32(1);
+            var dev = reader.GetInt32(2);     // -1 si DeviceAddress est NULL
+            keys.Add((dt, num, dev));
+        }
+
+        return keys;
+    }
+
+
     #endregion
 
-    #region Schema helpers
+    #region Schema / Bulk helpers
 
     private static DataTable CreateEmptyTableFromSchema(SqlConnection connection, SqlTransaction transaction, string tableName)
     {
         var dt = new DataTable();
 
         using var cmd = new SqlCommand($"SELECT TOP 0 * FROM {tableName};", connection, transaction);
-        using var adapter = new Microsoft.Data.SqlClient.SqlDataAdapter(cmd);
+        using var adapter = new SqlDataAdapter(cmd);
         adapter.Fill(dt); // remplit uniquement le schéma
 
         return dt;
     }
 
-    private static async Task TruncateTableAsync(SqlConnection connection, SqlTransaction transaction, string tableName)
+    private static async Task<int> GetMaxIdAsync(
+        SqlConnection connection,
+        SqlTransaction transaction,
+        string tableName,
+        string idColumnName,
+        CancellationToken cancellationToken)
     {
-        Logger.Info("Truncate", $"TRUNCATE TABLE {tableName}.");
-        var sql = $"TRUNCATE TABLE {tableName};";
+        var sql = $"SELECT ISNULL(MAX({idColumnName}), 0) FROM {tableName};";
         await using var cmd = new SqlCommand(sql, connection, transaction);
-        await cmd.ExecuteNonQueryAsync();
+        var result = await cmd.ExecuteScalarAsync(cancellationToken);
+        return (result == null || result == DBNull.Value)
+            ? 0
+            : Convert.ToInt32(result, CultureInfo.InvariantCulture);
     }
 
     private static void BulkInsert(SqlTransaction transaction, DataTable table, string tableName)
@@ -343,6 +412,7 @@ internal static class CsvToShadowImporter
         var connection = transaction.Connection
                          ?? throw new InvalidOperationException("Transaction sans connexion associée.");
 
+        // On conserve les valeurs des colonnes ID_* que nous avons calculées
         using var bulk = new SqlBulkCopy(connection, SqlBulkCopyOptions.KeepIdentity, transaction)
         {
             DestinationTableName = tableName
@@ -364,17 +434,17 @@ internal static class CsvToShadowImporter
 
     #endregion
 
-    #region Mapping helpers
+    #region Mapping TRANSACTIONS / PAYMENTS
 
     private static void MapTransactionRow(
         CsvReader csv,
         ReferenceData referenceData,
         DataRow row,
-        int logicalId,
+        int transId,
         long rowNumber)
     {
-        // ID technique interne à la moulinette
-        row["ID_TRANSACTIONS"] = logicalId;
+        // ID technique interne (dans la vraie table)
+        row["ID_TRANSACTIONS"] = transId;
 
         // Dates / heures
         var transStartStr = GetField(csv, "Transaction_StartDateTime");
@@ -398,7 +468,7 @@ internal static class CsvToShadowImporter
         int terminalsId = ResolveTerminalsId(referenceData, stationCode, terminalCode, terminalNumberStr, rowNumber);
         row["TerminalsID"] = terminalsId;
 
-        // Type de transaction : X (identique à ce qu'on observe dans l'historique)
+        // Type de transaction : X (identique à l'historique)
         row["TransType"] = "X";
 
         // Quantité / prix / montants
@@ -426,43 +496,36 @@ internal static class CsvToShadowImporter
         var articleNumberStr = GetField(csv, "TransactionLineItem_Article_Number");
         var articleCode = GetField(csv, "TransactionLineItem_Article_Code");
         var articleDescription = GetField(csv, "TransactionLineItem_Article_Description");
-
         var articleId = ParseInt(articleNumberStr, "TransactionLineItem_Article_Number", rowNumber);
+
         row["ArticleID"] = articleId;
         row["ArticleCode"] = string.IsNullOrWhiteSpace(articleCode) ? DBNull.Value : articleCode;
         row["ArticleDescription"] = string.IsNullOrWhiteSpace(articleDescription) ? DBNull.Value : articleDescription;
 
-        // Distributeur / pistolet / cuve
+        // Distributeur / pistolet
         var dispenserStr = GetField(csv, "TransactionLineItem_DispenserNumber");
         var nozzleStr = GetField(csv, "TransactionLineItem_NozzleNumber");
 
         row["DeviceAddress"] = ParseIntNullable(dispenserStr, "TransactionLineItem_DispenserNumber", rowNumber) ?? (object)DBNull.Value;
         row["SubDeviceAddress"] = ParseIntNullable(nozzleStr, "TransactionLineItem_NozzleNumber", rowNumber) ?? (object)DBNull.Value;
 
-        // TankNumber via lookup (StationsID + ArticlesID)
+        // TankNumber via lookup
         int? tankNumber = ResolveTankNumber(referenceData, stationCode, articleId, rowNumber);
         row["TankNumber"] = tankNumber.HasValue ? (object)tankNumber.Value : DBNull.Value;
 
-        // Status, WasExported, etc.
+        // Status / export
         row["TransStatus"] = DBNull.Value;
         row["WasExported"] = "N";
-
-        // FileID : on marque explicitement les lignes issues du flux ECPOL
         row["FileID"] = -1;
 
-        // Dates système / poll : on fixe un horodatage unique pour l'import
+        // Dates système / poll
         var now = DateTime.Now;
-        row["PollDateTime"] = now;          // date de "poll" côté moulinette
-        row["InsertDateTime"] = now;        // date d'insertion dans la shadow
-
-        // TypeOfTransaction, Fiscal*
-        row["TypeOfTransaction"] = DBNull.Value;
-        MapFiscalColumns(csv, row, rowNumber);
-
+        row["PollDateTime"] = now;
+        row["InsertDateTime"] = now;
         row["LastChangedDateTime"] = now;
         row["LastChangedByUser"] = "hecpoll-sync";
 
-        // ExportedCommon / ExportedCustomer / ModifiedFlag / FleetImport
+        // Export flags
         var exportedCommon = GetField(csv, "Transaction_IsExportedCommon");
         var exportedCustomer = GetField(csv, "Transaction_IsExportedCustomer");
 
@@ -470,9 +533,15 @@ internal static class CsvToShadowImporter
         row["ExportedCustomer"] = exportedCustomer.Equals("True", StringComparison.OrdinalIgnoreCase) ? "Y" : "N";
         row["ModifiedFlag"] = "N";
         row["FleetImport"] = "Y";
+
+        // Fiscal
+        row["TypeOfTransaction"] = DBNull.Value;
+        MapFiscalColumns(csv, row, rowNumber);
     }
 
-    // Normalise une plaque pour lookup : on ne garde que les caractères alphanumériques, en majuscules.
+    // Normalise une plaque pour le lookup VEHICLES :
+    // - enlève les espaces, tirets, caractères non alphanumériques
+    // - met en majuscule
     private static string NormalizePlate(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -484,11 +553,12 @@ internal static class CsvToShadowImporter
             if (char.IsLetterOrDigit(c))
                 sb.Append(char.ToUpperInvariant(c));
         }
-
         return sb.ToString();
     }
 
-    // Normalise un numéro de carte pour lookup : trim + majuscules
+    // Normalise un numéro de carte pour le lookup CARDS :
+    // - trim
+    // - majuscules
     private static string NormalizeCardNumber(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -501,16 +571,13 @@ internal static class CsvToShadowImporter
         CsvReader csv,
         ReferenceData referenceData,
         DataRow row,
-        int logicalId,
+        int paymentId,
+        int transactionId,
         long rowNumber)
     {
-        var contractNumberEcpol = GetField(csv, "Contract_Number");
-
         // ID technique
-        row["ID_PAYMENTS"] = logicalId;
-
-        // Lien vers TRANSACTIONS_SHADOW
-        row["TransactionsID"] = logicalId;
+        row["ID_PAYMENTS"] = paymentId;
+        row["TransactionsID"] = transactionId;
 
         // Date / heure / numéro
         var transStartStr = GetField(csv, "Transaction_StartDateTime");
@@ -524,13 +591,13 @@ internal static class CsvToShadowImporter
         var articleNumberStr = GetField(csv, "TransactionLineItem_Article_Number");
         var articleCode = GetField(csv, "TransactionLineItem_Article_Code");
         var articleDescription = GetField(csv, "TransactionLineItem_Article_Description");
-
         var articleId = ParseInt(articleNumberStr, "TransactionLineItem_Article_Number", rowNumber);
+
         row["TransArticleID"] = articleId;
         row["TransArticleCode"] = string.IsNullOrWhiteSpace(articleCode) ? DBNull.Value : articleCode;
         row["TransArticleDescription"] = string.IsNullOrWhiteSpace(articleDescription) ? DBNull.Value : articleDescription;
 
-        // Montants au niveau transaction
+        // Montants
         row["TransQuantity"] = ParseDouble(GetField(csv, "TransactionLineItem_Quantity_Value"), "TransactionLineItem_Quantity_Value", rowNumber);
         row["TransSinglePriceInclSold"] = ParseDecimal(GetField(csv, "TransactionLineItem_GrossSellUnitPrice_Amount"), "TransactionLineItem_GrossSellUnitPrice_Amount", rowNumber);
         row["TransAmount"] = ParseDecimal(GetField(csv, "TransactionLineItem_GrossSellAmount_Amount"), "TransactionLineItem_GrossSellAmount_Amount", rowNumber);
@@ -549,7 +616,11 @@ internal static class CsvToShadowImporter
         var terminalNumberStr = GetField(csv, "Terminal_Number");
         int terminalsId = ResolveTerminalsId(referenceData, stationCode, terminalCode, terminalNumberStr, rowNumber);
 
-        // MandatorsID / MandatorNumber / MandatorDescription via STATIONS.MandatorsID + MANDATORS.Number/Description
+        row["TerminalsID"] = terminalsId;
+        row["TerminalStationCode"] = string.IsNullOrWhiteSpace(stationCode) ? DBNull.Value : stationCode;
+        row["TerminalNumber"] = string.IsNullOrWhiteSpace(terminalNumberStr) ? DBNull.Value : terminalNumberStr;
+
+        // Mandants
         int? mandatorsId = null;
         string? mandatorNumber = null;
         string? mandatorDescription = null;
@@ -572,30 +643,22 @@ internal static class CsvToShadowImporter
         row["MandatorNumber"] = string.IsNullOrWhiteSpace(mandatorNumber) ? DBNull.Value : mandatorNumber;
         row["MandatorDescription"] = string.IsNullOrWhiteSpace(mandatorDescription) ? DBNull.Value : mandatorDescription;
 
-
-        row["TerminalsID"] = terminalsId;
-        row["TerminalStationCode"] = string.IsNullOrWhiteSpace(stationCode) ? DBNull.Value : stationCode;
-        row["TerminalNumber"] = string.IsNullOrWhiteSpace(terminalNumberStr) ? DBNull.Value : terminalNumberStr;
-
-        // On ne renseigne pas MandatorNumber / MandatorDescription tant qu'on ne connaît pas le schéma exact de MANDATORS
-        row["MandatorNumber"] = DBNull.Value;
-        row["MandatorDescription"] = DBNull.Value;
-
-        // ContractsID via CONTRACTS.Number
+        // Contrat
+        var contractNumberCsv = GetField(csv, "Contract_Number");
         int? contractsId = null;
-        if (!string.IsNullOrWhiteSpace(contractNumberEcpol) &&
-            referenceData.ContractsByNumber.TryGetValue(contractNumberEcpol, out var cid))
+        if (!string.IsNullOrWhiteSpace(contractNumberCsv) &&
+            referenceData.ContractsByNumber.TryGetValue(contractNumberCsv, out var cid))
         {
             contractsId = cid;
         }
-        else if (!string.IsNullOrWhiteSpace(contractNumberEcpol))
+        else if (!string.IsNullOrWhiteSpace(contractNumberCsv))
         {
             Logger.Warning("LookupContracts",
-                "Aucun contrat trouvé pour ce Contract_Number (ECPOL) dans CONTRACTS.Number.",
-                new { ContractNumber = contractNumberEcpol, Row = rowNumber });
+                "Aucun contrat trouvé pour ce Contract_Number (CSV HECPOLL SAAS) dans CONTRACTS.Number.",
+                new { ContractNumber = contractNumberCsv, Row = rowNumber });
         }
         row["ContractsID"] = contractsId.HasValue ? (object)contractsId.Value : DBNull.Value;
-        row["ContractNumber"] = string.IsNullOrWhiteSpace(contractNumberEcpol) ? DBNull.Value : contractNumberEcpol;
+        row["ContractNumber"] = string.IsNullOrWhiteSpace(contractNumberCsv) ? DBNull.Value : contractNumberCsv;
 
         // Carte 1
         var cardOnePan = GetField(csv, "CardOne_Pan");
@@ -614,15 +677,18 @@ internal static class CsvToShadowImporter
         row["CardValidTo"] = DBNull.Value;
         row["CardHolder"] = string.IsNullOrWhiteSpace(cardOneHolder) ? DBNull.Value : cardOneHolder;
 
-        // Carte 2 (si présente)
+        // Carte 2
         var cardTwoPan = GetField(csv, "CardTwo_Pan");
         var cardTwoNumber = GetField(csv, "CardTwo_Number");
         var cardTwoHolder = GetField(csv, "CardTwo_Holder");
 
-        // CardsID (carte 1) via CARDS.Number
+        row["CardPAN2"] = string.IsNullOrWhiteSpace(cardTwoPan) ? DBNull.Value : cardTwoPan;
+        row["CardNumber2"] = string.IsNullOrWhiteSpace(cardTwoNumber) ? DBNull.Value : cardTwoNumber;
+        row["CardHolder2"] = string.IsNullOrWhiteSpace(cardTwoHolder) ? DBNull.Value : cardTwoHolder;
+
+        // CardsID (carte 1)
         int? cardsId = null;
         var cardOneKey = NormalizeCardNumber(cardOneNumber);
-
         if (!string.IsNullOrEmpty(cardOneKey) &&
             referenceData.CardsByNumber.TryGetValue(cardOneKey, out var cId1))
         {
@@ -631,15 +697,14 @@ internal static class CsvToShadowImporter
         else if (!string.IsNullOrWhiteSpace(cardOneNumber))
         {
             Logger.Warning("LookupCards",
-                "Aucune carte trouvée pour CardOne_Number (ECPOL) dans CARDS.Number.",
+                "Aucune carte trouvée pour CardOne_Number (CSV HECPOLL SAAS) dans CARDS.Number.",
                 new { CardNumber = cardOneNumber, CardKey = cardOneKey, Row = rowNumber });
         }
         row["CardsID"] = cardsId.HasValue ? (object)cardsId.Value : DBNull.Value;
 
-        // CardsID2 (carte 2) via CARDS.Number
+        // CardsID2 (carte 2)
         int? cardsId2 = null;
         var cardTwoKey = NormalizeCardNumber(cardTwoNumber);
-
         if (!string.IsNullOrEmpty(cardTwoKey) &&
             referenceData.CardsByNumber.TryGetValue(cardTwoKey, out var cId2))
         {
@@ -648,16 +713,12 @@ internal static class CsvToShadowImporter
         else if (!string.IsNullOrWhiteSpace(cardTwoNumber))
         {
             Logger.Warning("LookupCards",
-                "Aucune carte trouvée pour CardTwo_Number (ECPOL) dans CARDS.Number.",
+                "Aucune carte trouvée pour CardTwo_Number (CSV HECPOLL SAAS) dans CARDS.Number.",
                 new { CardNumber = cardTwoNumber, CardKey = cardTwoKey, Row = rowNumber });
         }
         row["CardsID2"] = cardsId2.HasValue ? (object)cardsId2.Value : DBNull.Value;
 
-        row["CardPAN2"] = string.IsNullOrWhiteSpace(cardTwoPan) ? DBNull.Value : cardTwoPan;
-        row["CardNumber2"] = string.IsNullOrWhiteSpace(cardTwoNumber) ? DBNull.Value : cardTwoNumber;
-        row["CardHolder2"] = string.IsNullOrWhiteSpace(cardTwoHolder) ? DBNull.Value : cardTwoHolder;
-
-        // Client / conducteur / véhicule
+        // Client
         var customerNumber = GetField(csv, "Customer_Number");
         var customerFirstName = GetField(csv, "Customer_FirstName");
         var customerLastName = GetField(csv, "Customer_LastName");
@@ -667,10 +728,9 @@ internal static class CsvToShadowImporter
         row["CustomerName"] = !string.IsNullOrWhiteSpace(customerCompany)
             ? customerCompany
             : string.IsNullOrWhiteSpace(customerLastName + customerFirstName)
-                ? DBNull.Value
+                ? (object)DBNull.Value
                 : $"{customerFirstName} {customerLastName}".Trim();
 
-        // CustomersID via CUSTOMERS.Number
         int? customersId = null;
         if (!string.IsNullOrWhiteSpace(customerNumber) &&
             referenceData.CustomersByNumber.TryGetValue(customerNumber, out var custInfo))
@@ -680,11 +740,12 @@ internal static class CsvToShadowImporter
         else if (!string.IsNullOrWhiteSpace(customerNumber))
         {
             Logger.Warning("LookupCustomers",
-                "Aucun client trouvé pour ce Customer_Number (ECPOL) dans CUSTOMERS.Number.",
+                "Aucun client trouvé pour ce Customer_Number (CSV HECPOLL SAAS) dans CUSTOMERS.Number.",
                 new { CustomerNumber = customerNumber, Row = rowNumber });
         }
         row["CustomersID"] = customersId.HasValue ? (object)customersId.Value : DBNull.Value;
 
+        // Conducteur
         var driverNumber = GetField(csv, "Driver_Number");
         var driverFirstName = GetField(csv, "Driver_FirstName");
         var driverLastName = GetField(csv, "Driver_LastName");
@@ -694,16 +755,15 @@ internal static class CsvToShadowImporter
             ? DBNull.Value
             : $"{driverFirstName} {driverLastName}".Trim();
 
+        // Véhicule
         var vehicleNumber = GetField(csv, "Vehicle_Number");
         var vehicleDescription = GetField(csv, "Vehicle_Description");
         var vehicleLicensePlate = GetField(csv, "Vehicle_LicensePlate");
 
         row["VehicleLicensePlate"] = string.IsNullOrWhiteSpace(vehicleLicensePlate) ? DBNull.Value : vehicleLicensePlate;
 
-        // VehiclesID via VEHICLES.LicensePlate
         int? vehiclesId = null;
         var plateKey = NormalizePlate(vehicleLicensePlate);
-
         if (!string.IsNullOrEmpty(plateKey) &&
             referenceData.VehiclesByPlate.TryGetValue(plateKey, out var vehId))
         {
@@ -712,16 +772,16 @@ internal static class CsvToShadowImporter
         else if (!string.IsNullOrWhiteSpace(vehicleLicensePlate))
         {
             Logger.Warning("LookupVehicles",
-                "Aucun véhicule trouvé pour cette plaque (ECPOL) dans VEHICLES.LicensePlate.",
+                "Aucun véhicule trouvé pour cette plaque (CSV HECPOLL SAAS) dans VEHICLES.LicensePlate.",
                 new { VehicleLicensePlate = vehicleLicensePlate, PlateKey = plateKey, Row = rowNumber });
         }
         row["VehiclesID"] = vehiclesId.HasValue ? (object)vehiclesId.Value : DBNull.Value;
 
-        // Mileage (dans le CSV, on reçoit parfois des valeurs décimales du type "40066.00")
+        // Mileage
         var mileageStr = GetField(csv, "Mileage");
         row["Mileage"] = ParseMileage(mileageStr, rowNumber) ?? (object)DBNull.Value;
 
-        // TenderCode (0 = carte, selon cross-check avec PAYMENTS existants)
+        // TenderCode
         var paymentCard = GetField(csv, "Payment_Card");
         var paymentCash = GetField(csv, "Payment_Cash");
         var paymentVoucher = GetField(csv, "Payment_Voucher");
@@ -729,42 +789,29 @@ internal static class CsvToShadowImporter
         var tenderCode = ResolveTenderCode(paymentCard, paymentCash, paymentVoucher, rowNumber);
         row["TenderCode"] = tenderCode;
 
-        // Number : numéro de ligne de paiement – 1 seule ligne par transaction actuellement
+        // Number : toujours 1 (une ligne de paiement par transaction dans ce flux)
         row["Number"] = 1;
 
-        // Devise / group code, etc.
+        // Divers non alimentés
         row["CurrencySymbol"] = DBNull.Value;
         row["NbrOfNotes"] = DBNull.Value;
         row["NotesAmount"] = DBNull.Value;
         row["IDGroupCode"] = DBNull.Value;
         row["AdditionalEntry"] = DBNull.Value;
 
-        // ModifiedFlag / FleetImport
-        row["ModifiedFlag"] = "N";
-        row["FleetImport"] = "Y";
-
-        // TanksID via (Station_Code, ArticleID) -> TANKS.ID_TANKS
+        // TanksID via (Station_Code, ArticleID)
         int? tanksId = null;
-        if (referenceData.StationByCode.TryGetValue(stationCode, out var stationIdForTanks))
+        if (referenceData.StationByCode.TryGetValue(stationCode, out var stationIdForTanks) &&
+            referenceData.TanksIdByStationAndArticleId.TryGetValue((stationIdForTanks, articleId), out var tid))
         {
-            if (referenceData.TanksIdByStationAndArticleId.TryGetValue((stationIdForTanks, articleId), out var tid))
-            {
-                tanksId = tid;
-            }
-            else
-            {
-                Logger.Warning("LookupTanksID",
-                    "Aucune cuve (ID_TANKS) trouvée pour cette station et cet article (PAYMENTS).",
-                    new { StationCode = stationCode, StationId = stationIdForTanks, ArticleId = articleId, Row = rowNumber });
-            }
+            tanksId = tid;
         }
         else
         {
             Logger.Warning("LookupTanksID",
-                "Station introuvable pour le calcul de TanksID (PAYMENTS).",
+                "Aucune cuve (ID_TANKS) trouvée pour cette station et cet article (PAYMENTS).",
                 new { StationCode = stationCode, ArticleId = articleId, Row = rowNumber });
         }
-
         row["TanksID"] = tanksId.HasValue ? (object)tanksId.Value : DBNull.Value;
 
         // Distributeur / Nozzle
@@ -773,37 +820,21 @@ internal static class CsvToShadowImporter
         row["NozzleNumber"] = string.IsNullOrWhiteSpace(nozzleStr) ? DBNull.Value : nozzleStr;
         row["NozzleDescription"] = DBNull.Value;
 
+        // Modified / Fleet
+        row["ModifiedFlag"] = "N";
+        row["FleetImport"] = "Y";
     }
 
-    private static int? ParseMileage(string value, long rowNumber)
-    {
-        if (string.IsNullOrWhiteSpace(value) || value.Equals("NULL", StringComparison.OrdinalIgnoreCase))
-            return null;
+    #endregion
 
-        // 1) Essai direct en entier (valeurs déjà "propres")
-        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var intResult))
-        {
-            return intResult;
-        }
-
-        // 2) Si le CSV nous envoie un "40066.00" ou similaire, on parse en double et on arrondit
-        if (double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var doubleResult))
-        {
-            // Arrondi au km le plus proche (40066.50 -> 40067)
-            return (int)Math.Round(doubleResult, MidpointRounding.AwayFromZero);
-        }
-
-        var msg = $"Impossible de parser le kilométrage '{value}' pour Mileage (ligne {rowNumber}).";
-        Logger.Error("ParseMileage", msg);
-        throw new InvalidOperationException(msg);
-    }
+    #region Resolve helpers
 
     private static int ResolveTerminalsId(
-    ReferenceData referenceData,
-    string stationCode,
-    string terminalCode,
-    string terminalNumberStr,
-    long rowNumber)
+        ReferenceData referenceData,
+        string stationCode,
+        string terminalCode,
+        string terminalNumberStr,
+        long rowNumber)
     {
         if (!referenceData.StationByCode.TryGetValue(stationCode, out var stationId))
         {
@@ -821,21 +852,21 @@ internal static class CsvToShadowImporter
 
         TerminalInfo? match = null;
 
-        // 1. Essayer sur Code (mapping direct ECPOL -> TERMINALS.Code)
+        // 1. Essayer sur Code
         if (!string.IsNullOrWhiteSpace(terminalCode))
         {
             match = terminals.FirstOrDefault(t =>
                 string.Equals(t.Code, terminalCode, StringComparison.OrdinalIgnoreCase));
         }
 
-        // 2. Essayer sur Number (TERMINALS.Number)
+        // 2. Essayer sur Number
         if (match is null && !string.IsNullOrWhiteSpace(terminalNumberStr))
         {
             match = terminals.FirstOrDefault(t =>
                 string.Equals(t.Number, terminalNumberStr, StringComparison.OrdinalIgnoreCase));
         }
 
-        // 3. Essayer sur TerminalNumber (TERMINALS.TerminalNumber)
+        // 3. Essayer sur TerminalNumber
         if (match is null && !string.IsNullOrWhiteSpace(terminalNumberStr))
         {
             match = terminals.FirstOrDefault(t =>
@@ -851,13 +882,13 @@ internal static class CsvToShadowImporter
         var fallback = terminals.OrderBy(t => t.Id).First();
 
         Logger.Warning("LookupTerminals",
-            "Aucun terminal ne correspond exactement aux informations ECPOL, utilisation du premier terminal de la station.",
+            "Aucun terminal ne correspond exactement aux infos du CSV HECPOLL SAAS, utilisation du premier terminal de la station.",
             new
             {
                 StationCode = stationCode,
                 StationId = stationId,
-                TerminalCodeEcpol = terminalCode,
-                TerminalNumberEcpol = terminalNumberStr,
+                TerminalCodeCsv = terminalCode,
+                TerminalNumberCsv = terminalNumberStr,
                 FallbackTerminalId = fallback.Id,
                 FallbackTerminalCode = fallback.Code,
                 FallbackTerminalNumber = fallback.Number,
@@ -873,7 +904,6 @@ internal static class CsvToShadowImporter
         int articleId,
         long rowNumber)
     {
-        // STATIONS.StationCode -> ID_STATIONS
         if (!referenceData.StationByCode.TryGetValue(stationCode, out var stationId))
         {
             Logger.Warning("LookupTanks", "Station introuvable pour le calcul de TankNumber.",
@@ -888,7 +918,6 @@ internal static class CsvToShadowImporter
             return null;
         }
 
-        // TANKS : (StationsID, ArticlesID) -> Number
         if (referenceData.TankNumberByStationAndArticleId.TryGetValue((stationId, articleId), out var tankNumber))
         {
             return tankNumber;
@@ -900,44 +929,11 @@ internal static class CsvToShadowImporter
         return null;
     }
 
-    private static void MapFiscalColumns(CsvReader csv, DataRow row, long rowNumber)
-    {
-        var docType = GetField(csv, "Transaction_AdditionalProperties_Fiscalization_DocumentType");
-        var amountStr = GetField(csv, "Transaction_AdditionalProperties_Fiscalization_Amount");
-        var discountStr = GetField(csv, "Transaction_AdditionalProperties_Fiscalization_Discount");
-        var taxAmountStr = GetField(csv, "Transaction_AdditionalProperties_Fiscalization_TaxAmount");
-
-        row["FiscalDocType"] = string.IsNullOrWhiteSpace(docType) ? DBNull.Value : docType;
-        row["FiscalAmount"] = ParseDoubleNullable(amountStr, "Transaction_AdditionalProperties_Fiscalization_Amount", rowNumber) ?? (object)DBNull.Value;
-        row["FiscalDiscount"] = ParseDoubleNullable(discountStr, "Transaction_AdditionalProperties_Fiscalization_Discount", rowNumber) ?? (object)DBNull.Value;
-        row["FiscalTaxAmount"] = ParseDoubleNullable(taxAmountStr, "Transaction_AdditionalProperties_Fiscalization_TaxAmount", rowNumber) ?? (object)DBNull.Value;
-    }
-
-    private static string ResolveTenderCode(string paymentCard, string paymentCash, string paymentVoucher, long rowNumber)
-    {
-        var isCard = paymentCard.Equals("True", StringComparison.OrdinalIgnoreCase);
-        var isCash = paymentCash.Equals("True", StringComparison.OrdinalIgnoreCase);
-        var isVoucher = paymentVoucher.Equals("True", StringComparison.OrdinalIgnoreCase);
-
-        // Cas observé dans tes fichiers : True/False/False => TenderCode = "0"
-        if (isCard && !isCash && !isVoucher)
-        {
-            return "0";
-        }
-
-        var msg = $"Combinaison de moyen de paiement non gérée par la moulinette (Card={paymentCard}, Cash={paymentCash}, Voucher={paymentVoucher}).";
-        Logger.Error("TenderCode", msg, data: new { paymentCard, paymentCash, paymentVoucher, Row = rowNumber });
-        throw new InvalidOperationException(msg);
-    }
-
     #endregion
 
-    #region Field helpers
+    #region Field / parse helpers
 
-    private static string GetField(CsvReader csv, string name)
-    {
-        return csv.GetField(name) ?? string.Empty;
-    }
+    private static string GetField(CsvReader csv, string name) => csv.GetField(name) ?? string.Empty;
 
     private static DateTimeOffset ParseDateTimeOffset(string value, string fieldName, long rowNumber)
     {
@@ -945,10 +941,7 @@ internal static class CsvToShadowImporter
         {
             var msg = $"Valeur vide pour le champ {fieldName} (ligne {rowNumber}).";
             Logger.Error("ParseDateTime", msg);
-            throw new InvalidOperationException(msg);
         }
-
-        // Exemple : 2020-06-16T09:15:00.0000000+02:00
         if (!DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var dto))
         {
             var msg = $"Impossible de parser la date '{value}' pour {fieldName} (ligne {rowNumber}).";
@@ -999,7 +992,6 @@ internal static class CsvToShadowImporter
         if (string.IsNullOrWhiteSpace(value) || value.Equals("NULL", StringComparison.OrdinalIgnoreCase))
             return 0d;
 
-        // ECPOL nous donne des nombres avec point décimal
         if (!double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var result))
         {
             var msg = $"Impossible de parser le double '{value}' pour {fieldName} (ligne {rowNumber}).";
@@ -1033,5 +1025,55 @@ internal static class CsvToShadowImporter
         return result;
     }
 
+    private static int? ParseMileage(string value, long rowNumber)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value.Equals("NULL", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        // 1) Essai direct en entier
+        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var intResult))
+            return intResult;
+
+        // 2) Si le CSV nous envoie un "40066.00" ou similaire, on parse en double et on arrondit
+        if (double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var doubleResult))
+            return (int)Math.Round(doubleResult, MidpointRounding.AwayFromZero);
+
+        var msg = $"Impossible de parser le kilométrage '{value}' pour Mileage (ligne {rowNumber}).";
+        Logger.Error("ParseMileage", msg);
+        throw new InvalidOperationException(msg);
+    }
+
+    private static void MapFiscalColumns(CsvReader csv, DataRow row, long rowNumber)
+    {
+        var docType = GetField(csv, "Transaction_AdditionalProperties_Fiscalization_DocumentType");
+        var amountStr = GetField(csv, "Transaction_AdditionalProperties_Fiscalization_Amount");
+        var discountStr = GetField(csv, "Transaction_AdditionalProperties_Fiscalization_Discount");
+        var taxAmountStr = GetField(csv, "Transaction_AdditionalProperties_Fiscalization_TaxAmount");
+
+        row["FiscalDocType"] = string.IsNullOrWhiteSpace(docType) ? DBNull.Value : docType;
+        row["FiscalAmount"] = ParseDoubleNullable(amountStr, "Transaction_AdditionalProperties_Fiscalization_Amount", rowNumber) ?? (object)DBNull.Value;
+        row["FiscalDiscount"] = ParseDoubleNullable(discountStr, "Transaction_AdditionalProperties_Fiscalization_Discount", rowNumber) ?? (object)DBNull.Value;
+        row["FiscalTaxAmount"] = ParseDoubleNullable(taxAmountStr, "Transaction_AdditionalProperties_Fiscalization_TaxAmount", rowNumber) ?? (object)DBNull.Value;
+    }
+
+    private static string ResolveTenderCode(string paymentCard, string paymentCash, string paymentVoucher, long rowNumber)
+    {
+        var isCard = paymentCard.Equals("True", StringComparison.OrdinalIgnoreCase);
+        var isCash = paymentCash.Equals("True", StringComparison.OrdinalIgnoreCase);
+        var isVoucher = paymentVoucher.Equals("True", StringComparison.OrdinalIgnoreCase);
+
+        // Cas observé : True/False/False => TenderCode = "0" (carte)
+        if (isCard && !isCash && !isVoucher)
+            return "0";
+
+        var msg = $"Combinaison de moyen de paiement non gérée (Card={paymentCard}, Cash={paymentCash}, Voucher={paymentVoucher}).";
+        Logger.Error("TenderCode", msg, data: new { paymentCard, paymentCash, paymentVoucher, Row = rowNumber });
+        throw new InvalidOperationException(msg);
+    }
+
     #endregion
 }
+
+
+
+

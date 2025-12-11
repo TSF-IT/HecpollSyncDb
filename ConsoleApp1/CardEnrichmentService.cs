@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using Microsoft.Data.SqlClient;
 
+namespace Hecpoll.Sync;
+
 /// <summary>
 /// Service d'enrichissement des cartes / véhicules / conducteurs.
 /// L'idée est d'éviter de recalculer à chaque ligne et de centraliser la logique

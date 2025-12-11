@@ -3,6 +3,8 @@ using Hecpoll.Sync;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
 
+namespace Hecpoll.Sync;
+
 /// <summary>
 /// Logique d'accès / écriture des paiements et transactions shadow.
 /// Toute la mécanique "je trouve la transaction, je la crée dans TRANSACTIONS_SHADOW,

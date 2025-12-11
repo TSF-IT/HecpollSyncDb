@@ -1,5 +1,7 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using System.Text.Json.Serialization;
+
+namespace Hecpoll.Sync;
 
 internal static class Logger
 {
@@ -60,7 +62,7 @@ internal static class Logger
             File.AppendAllText(_logFilePath, json + Environment.NewLine);
         }
 
-        // Echo console (utile quand tu lances la moulinette à la main)
+        // Echo console (utile en lancement manuel)
         Console.WriteLine($"[{entry.Timestamp:yyyy-MM-dd HH:mm:ss}] {level} {phase} - {message}");
     }
 
